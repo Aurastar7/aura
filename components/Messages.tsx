@@ -120,11 +120,11 @@ const Messages: React.FC<MessagesProps> = ({
   };
 
   const chatList = (
-    <div className="rounded-2xl border-2 border-slate-200 dark:border-slate-800 overflow-hidden">
+    <div className="rounded-2xl border-2 border-slate-200 dark:border-slate-800 overflow-hidden h-full min-h-0 flex flex-col">
       <div className="px-4 py-3 border-b-2 border-slate-200 dark:border-slate-800">
         <h2 className="text-sm font-semibold text-slate-500">Choose user</h2>
       </div>
-      <div className="divide-y divide-slate-200 dark:divide-slate-800 max-h-[60vh] overflow-auto">
+      <div className="divide-y divide-slate-200 dark:divide-slate-800 flex-1 min-h-0 overflow-y-auto">
         {candidates.length > 0 ? (
           candidates.map((candidate) => {
             const unread = unreadByUser.get(candidate.id) ?? 0;
@@ -170,7 +170,7 @@ const Messages: React.FC<MessagesProps> = ({
   );
 
   const chatWindow = activeChatUser ? (
-    <section className="rounded-2xl border-2 border-slate-200 dark:border-slate-800 overflow-hidden min-h-[66vh] flex flex-col">
+    <section className="rounded-2xl border-2 border-slate-200 dark:border-slate-800 overflow-hidden h-full min-h-0 flex flex-col">
       <div className="px-4 py-3 border-b-2 border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
           <button
@@ -205,7 +205,7 @@ const Messages: React.FC<MessagesProps> = ({
         </button>
       </div>
 
-      <div className="flex-1 px-4 py-4 space-y-2 overflow-auto">
+      <div className="flex-1 min-h-0 px-4 py-4 space-y-2 overflow-y-auto">
         {conversation.length > 0 ? (
           conversation.map((message) => {
             const isMine = message.fromId === currentUser.id;
@@ -285,7 +285,7 @@ const Messages: React.FC<MessagesProps> = ({
         )}
       </div>
 
-      <form onSubmit={submit} className="px-4 py-3 border-t-2 border-slate-200 dark:border-slate-800 space-y-2">
+      <form onSubmit={submit} className="shrink-0 px-4 py-3 border-t-2 border-slate-200 dark:border-slate-800 space-y-2">
         {(draftMediaType && draftMediaUrl) ? (
           <div className="rounded-xl border-2 border-slate-300 dark:border-slate-700 p-2 text-xs">
             <div className="flex items-center justify-between gap-2 mb-2">
@@ -338,22 +338,22 @@ const Messages: React.FC<MessagesProps> = ({
       </form>
     </section>
   ) : (
-    <div className="rounded-2xl border-2 border-slate-200 dark:border-slate-800 min-h-[66vh] flex items-center justify-center text-sm text-slate-500 p-8 text-center">
+    <div className="rounded-2xl border-2 border-slate-200 dark:border-slate-800 h-full min-h-0 flex items-center justify-center text-sm text-slate-500 p-8 text-center">
       Select user to start a conversation.
     </div>
   );
 
   return (
-    <div className="pb-[calc(env(safe-area-inset-bottom)+72px)] md:pb-6 h-full">
+    <div className="pb-[calc(env(safe-area-inset-bottom)+72px)] lg:pb-6 h-[calc(var(--app-height)-56px)] lg:h-[var(--app-height)] flex flex-col overflow-hidden">
       <header className="px-6 py-4 border-b-2 border-slate-200 dark:border-slate-800">
         <h1 className="text-2xl font-bold">Messages</h1>
       </header>
 
-      <div className="p-4 md:hidden">
+      <div className="p-4 lg:hidden flex-1 min-h-0">
         {mobilePane === 'list' ? chatList : chatWindow}
       </div>
 
-      <div className="hidden md:grid md:grid-cols-[300px_minmax(0,1fr)] gap-4 p-4 min-h-[70vh]">
+      <div className="hidden lg:grid lg:grid-cols-[300px_minmax(0,1fr)] gap-4 p-4 flex-1 min-h-0">
         {chatList}
         {chatWindow}
       </div>

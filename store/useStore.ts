@@ -139,9 +139,51 @@ const mergeById = <T extends { id: string }>(
   return [...map.values()];
 };
 
+const mergeUsers = (local: User[], remote: User[]): User[] => {
+  const map = new Map<string, User>();
+  remote.forEach((item) => map.set(item.id, item));
+  local.forEach((localUser) => {
+    const remoteUser = map.get(localUser.id);
+    if (!remoteUser) {
+      map.set(localUser.id, localUser);
+      return;
+    }
+
+    const preferLocal = newerIso(localUser.updatedAt, remoteUser.updatedAt);
+    const base = preferLocal ? localUser : remoteUser;
+    const other = preferLocal ? remoteUser : localUser;
+    map.set(localUser.id, {
+      ...base,
+      // Keep presence as newest heartbeat signal, but role/profile from newest updatedAt.
+      lastSeenAt: newerIso(localUser.lastSeenAt, remoteUser.lastSeenAt)
+        ? localUser.lastSeenAt
+        : remoteUser.lastSeenAt,
+      updatedAt: newerIso(base.updatedAt, other.updatedAt) ? base.updatedAt : other.updatedAt,
+    });
+  });
+  return [...map.values()];
+};
+
+const mergeGroups = (local: Group[], remote: Group[]): Group[] => {
+  const map = new Map<string, Group>();
+  remote.forEach((item) => map.set(item.id, item));
+  local.forEach((localGroup) => {
+    const remoteGroup = map.get(localGroup.id);
+    if (!remoteGroup) {
+      map.set(localGroup.id, localGroup);
+      return;
+    }
+
+    const localUpdatedAt = localGroup.updatedAt || localGroup.createdAt;
+    const remoteUpdatedAt = remoteGroup.updatedAt || remoteGroup.createdAt;
+    map.set(localGroup.id, newerIso(localUpdatedAt, remoteUpdatedAt) ? localGroup : remoteGroup);
+  });
+  return [...map.values()];
+};
+
 const mergeDb = (local: SocialDb, remote: SocialDb): SocialDb => ({
   ...remote,
-  users: mergeById(local.users, remote.users, (l, r) => (newerIso(l.lastSeenAt, r.lastSeenAt) ? l : r)),
+  users: mergeUsers(local.users, remote.users),
   follows: mergeById(local.follows, remote.follows, (l, r) => (newerIso(l.createdAt, r.createdAt) ? l : r)),
   posts: mergeById(local.posts, remote.posts, (l, r) => (newerIso(l.createdAt, r.createdAt) ? l : r)),
   postComments: mergeById(local.postComments, remote.postComments, (l, r) =>
@@ -152,7 +194,7 @@ const mergeDb = (local: SocialDb, remote: SocialDb): SocialDb => ({
     newerIso(l.createdAt, r.createdAt) ? l : r
   ),
   messages: mergeById(local.messages, remote.messages, (l, r) => (newerIso(l.createdAt, r.createdAt) ? l : r)),
-  groups: mergeById(local.groups, remote.groups, (l, r) => (newerIso(l.createdAt, r.createdAt) ? l : r)),
+  groups: mergeGroups(local.groups, remote.groups),
   groupMembers: mergeById(local.groupMembers, remote.groupMembers, (l, r) =>
     newerIso(l.createdAt, r.createdAt) ? l : r
   ),
@@ -272,7 +314,7 @@ export function useStore(): UseStore {
     const timer = window.setInterval(() => {
       if (remoteSynced) return;
       void bootstrap();
-    }, 2000);
+    }, 1200);
 
     return () => {
       cancelled = true;
@@ -303,7 +345,7 @@ export function useStore(): UseStore {
         syncHashRef.current = syncFingerprint(merged);
         setDb((prev) => withLocalSession(merged, prev));
       }
-    }, 80);
+    }, 60);
 
     return () => window.clearTimeout(timer);
   }, [db, remoteSynced]);
@@ -331,7 +373,7 @@ export function useStore(): UseStore {
 
     const timer = window.setInterval(() => {
       void pullRemote();
-    }, 3000);
+    }, 1500);
 
     return () => {
       disconnectSocket();
@@ -442,6 +484,7 @@ export function useStore(): UseStore {
       restricted: false,
       verified: false,
       createdAt,
+      updatedAt: createdAt,
       lastSeenAt: createdAt,
     };
 
@@ -901,6 +944,7 @@ export function useStore(): UseStore {
     if (!user) return fail('Please login first.');
     const displayName = patch.displayName.trim();
     if (displayName.length < 2) return fail('Display name is too short.');
+    const nowIso = new Date().toISOString();
 
     setDb((prev) => ({
       ...prev,
@@ -913,7 +957,8 @@ export function useStore(): UseStore {
               status: patch.status.trim(),
               avatar: patch.avatar.trim(),
               coverImage: patch.coverImage.trim(),
-              lastSeenAt: new Date().toISOString(),
+              updatedAt: nowIso,
+              lastSeenAt: nowIso,
             }
           : candidate
       ),
@@ -942,6 +987,7 @@ export function useStore(): UseStore {
       coverImage: `https://picsum.photos/seed/${encodeURIComponent(groupId)}-cover/1400/420`,
       verified: false,
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     };
     const member: GroupMember = {
       id: makeId('group-member'),
@@ -983,6 +1029,7 @@ export function useStore(): UseStore {
     }
 
     const canSetVerified = user.role === 'admin' || group.adminId === user.id;
+    const nowIso = new Date().toISOString();
 
     setDb((prev) => ({
       ...prev,
@@ -996,6 +1043,7 @@ export function useStore(): UseStore {
               coverImage: patch.coverImage.trim(),
               allowMemberPosts: patch.allowMemberPosts,
               verified: canSetVerified ? patch.verified : candidate.verified,
+              updatedAt: nowIso,
             }
           : candidate
       ),
@@ -1050,10 +1098,13 @@ export function useStore(): UseStore {
       return fail('Only group admin can change this setting.');
     }
 
+    const nowIso = new Date().toISOString();
     setDb((prev) => ({
       ...prev,
       groups: prev.groups.map((candidate) =>
-        candidate.id === groupId ? { ...candidate, allowMemberPosts: allow } : candidate
+        candidate.id === groupId
+          ? { ...candidate, allowMemberPosts: allow, updatedAt: nowIso }
+          : candidate
       ),
     }));
     return ok(allow ? 'Members can publish in this group.' : 'Only admin can publish in this group.');
@@ -1257,11 +1308,12 @@ export function useStore(): UseStore {
     const target = db.users.find((candidate) => candidate.id === userId);
     if (!target) return fail('User not found.');
 
+    const nowIso = new Date().toISOString();
     setDb((prev) => {
       const next = {
         ...prev,
         users: prev.users.map((candidate) =>
-          candidate.id === userId ? { ...candidate, role } : candidate
+          candidate.id === userId ? { ...candidate, role, updatedAt: nowIso } : candidate
         ),
       };
       return addNotification(next, {
@@ -1279,11 +1331,14 @@ export function useStore(): UseStore {
     const target = db.users.find((candidate) => candidate.id === userId);
     if (!target) return fail('User not found.');
 
+    const nowIso = new Date().toISOString();
     setDb((prev) => {
       const next: SocialDb = {
         ...prev,
         users: prev.users.map((candidate) =>
-          candidate.id === userId ? { ...candidate, banned } : candidate
+          candidate.id === userId
+            ? { ...candidate, banned, updatedAt: nowIso }
+            : candidate
         ),
         session:
           prev.session.userId === userId && banned
@@ -1305,11 +1360,14 @@ export function useStore(): UseStore {
     const target = db.users.find((candidate) => candidate.id === userId);
     if (!target) return fail('User not found.');
 
+    const nowIso = new Date().toISOString();
     setDb((prev) => {
       const next = {
         ...prev,
         users: prev.users.map((candidate) =>
-          candidate.id === userId ? { ...candidate, restricted } : candidate
+          candidate.id === userId
+            ? { ...candidate, restricted, updatedAt: nowIso }
+            : candidate
         ),
       };
       return addNotification(next, {
@@ -1329,10 +1387,11 @@ export function useStore(): UseStore {
     const target = db.users.find((candidate) => candidate.id === userId);
     if (!target) return fail('User not found.');
 
+    const nowIso = new Date().toISOString();
     setDb((prev) => ({
       ...prev,
       users: prev.users.map((candidate) =>
-        candidate.id === userId ? { ...candidate, verified } : candidate
+        candidate.id === userId ? { ...candidate, verified, updatedAt: nowIso } : candidate
       ),
     }));
     return ok(verified ? 'Verified badge granted.' : 'Verified badge removed.');

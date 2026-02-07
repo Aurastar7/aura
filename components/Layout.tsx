@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import Sidebar from './Sidebar';
 import { ICONS } from '../constants';
 import { AppView, User } from '../types';
@@ -32,6 +32,24 @@ const Layout: React.FC<LayoutProps> = ({
   onLogout,
   onCompose,
 }) => {
+  useEffect(() => {
+    const applyViewportHeight = () => {
+      const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+      document.documentElement.style.setProperty('--app-height', `${viewportHeight}px`);
+    };
+
+    applyViewportHeight();
+    window.addEventListener('resize', applyViewportHeight);
+    window.addEventListener('orientationchange', applyViewportHeight);
+    window.visualViewport?.addEventListener('resize', applyViewportHeight);
+
+    return () => {
+      window.removeEventListener('resize', applyViewportHeight);
+      window.removeEventListener('orientationchange', applyViewportHeight);
+      window.visualViewport?.removeEventListener('resize', applyViewportHeight);
+    };
+  }, []);
+
   const mobileItems: AppView[] = ['feed', 'explore', 'groups', 'notifications', 'messages', 'profile'];
 
   const iconByView: Record<AppView, React.FC<any>> = {
@@ -45,9 +63,9 @@ const Layout: React.FC<LayoutProps> = ({
   };
 
   return (
-    <div className="min-h-screen w-full overflow-x-hidden bg-slate-50 dark:bg-black transition-colors">
-      <div className="min-h-screen w-full max-w-[1440px] mx-auto flex justify-center">
-        <div className="hidden md:block w-20 lg:w-72 sticky top-0 h-screen border-r-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black">
+    <div className="min-h-[var(--app-height)] w-full overflow-x-hidden bg-slate-50 dark:bg-black transition-colors">
+      <div className="min-h-[var(--app-height)] w-full max-w-[1440px] mx-auto flex items-start justify-center">
+        <div className="hidden lg:block w-72 shrink-0 self-start sticky top-0 h-[var(--app-height)] border-r-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black">
           <Sidebar
             user={user}
             currentView={currentView}
@@ -62,16 +80,16 @@ const Layout: React.FC<LayoutProps> = ({
           />
         </div>
 
-        <main className="flex-1 w-full max-w-3xl border-r-0 md:border-r-2 border-slate-200 dark:border-slate-800 min-h-screen bg-white dark:bg-black pt-14 md:pt-0 pb-[calc(env(safe-area-inset-bottom)+72px)] md:pb-0">
+        <main className="flex-1 w-full max-w-3xl border-r-0 xl:border-r-2 border-slate-200 dark:border-slate-800 min-h-screen bg-white dark:bg-black pt-14 lg:pt-0 pb-[calc(env(safe-area-inset-bottom)+72px)] lg:pb-0">
           {children}
         </main>
 
-        <div className="hidden lg:block w-80 xl:w-96 sticky top-0 h-screen p-4 overflow-y-auto bg-slate-50 dark:bg-black">
+        <div className="hidden xl:block w-80 xl:w-96 shrink-0 self-start sticky top-0 h-[var(--app-height)] p-4 overflow-y-auto bg-slate-50 dark:bg-black">
           {rightPanel}
         </div>
       </div>
 
-      <div className="md:hidden fixed top-0 inset-x-0 z-40 border-b-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black px-4 py-3 flex items-center justify-between">
+      <div className="lg:hidden fixed top-0 inset-x-0 z-40 border-b-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black px-4 py-3 flex items-center justify-between">
         <button onClick={() => onChangeView('feed')} className="w-10 h-10 rounded-xl bg-slate-900 dark:bg-white dark:text-black text-white font-black grid place-items-center">A</button>
         <div className="flex items-center gap-2">
           <button onClick={onCompose} className="w-9 h-9 rounded-xl bg-slate-900 dark:bg-white dark:text-black text-white grid place-items-center">
@@ -83,7 +101,7 @@ const Layout: React.FC<LayoutProps> = ({
         </div>
       </div>
 
-      <nav className="md:hidden fixed bottom-0 inset-x-0 z-40 border-t-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black pb-[env(safe-area-inset-bottom)]">
+      <nav className="lg:hidden fixed bottom-0 inset-x-0 z-40 border-t-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black pb-[env(safe-area-inset-bottom)]">
         <div className="grid grid-cols-6">
           {mobileItems.map((view) => {
             const Icon = iconByView[view];

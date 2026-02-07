@@ -1,5 +1,6 @@
 :root {
   color-scheme: light;
+  --app-height: 100vh;
 }
 
 html.dark {

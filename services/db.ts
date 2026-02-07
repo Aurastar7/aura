@@ -33,6 +33,7 @@ const adminUser = (): User => ({
   restricted: false,
   verified: true,
   createdAt: now(),
+  updatedAt: now(),
   lastSeenAt: now(),
 });
 
@@ -46,6 +47,7 @@ const defaultGroup = (): Group => ({
   coverImage: 'https://picsum.photos/seed/group-general-cover/1400/420',
   verified: true,
   createdAt: now(),
+  updatedAt: now(),
 });
 
 const defaultGroupAdminMember = (): GroupMember => ({
@@ -85,7 +87,15 @@ const ensureAdmin = (users: User[]): User[] => {
   if (!found) return [adminUser(), ...users];
   return users.map((user) =>
     user.username === '313'
-      ? { ...user, role: 'admin', banned: false, restricted: false, verified: true, status: user.status ?? 'online' }
+      ? {
+          ...user,
+          role: 'admin',
+          banned: false,
+          restricted: false,
+          verified: true,
+          status: user.status ?? 'online',
+          updatedAt: user.updatedAt || user.createdAt || user.lastSeenAt || now(),
+        }
       : user
   );
 };
@@ -172,6 +182,7 @@ const normalizeDb = (input: Partial<SocialDb>): SocialDb => {
   const hydratedUsers = ensureAdmin(input.users ?? base.users).map((user) => ({
     ...user,
     status: user.status ?? '',
+    updatedAt: user.updatedAt || user.createdAt || user.lastSeenAt || now(),
   }));
   const groups = (input.groups?.length ? input.groups : base.groups).map((group) => ({
     ...group,
@@ -179,6 +190,7 @@ const normalizeDb = (input: Partial<SocialDb>): SocialDb => {
     coverImage:
       group.coverImage || `https://picsum.photos/seed/${encodeURIComponent(group.id)}-cover/1400/420`,
     verified: Boolean(group.verified),
+    updatedAt: group.updatedAt || group.createdAt || now(),
   }));
   const groupMembers = ensureGroupAdmins(groups, input.groupMembers ?? base.groupMembers);
   const posts = normalizePostReposts(
@@ -395,7 +407,7 @@ export const connectSyncSocket = (onEvent: (event: SyncEvent) => void) => {
     };
     socket.onclose = () => {
       if (isClosed) return;
-      reconnectTimer = window.setTimeout(open, 1200);
+      reconnectTimer = window.setTimeout(open, 700);
     };
     socket.onerror = () => {
       socket?.close();

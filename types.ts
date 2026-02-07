@@ -33,6 +33,7 @@ export interface User {
   restricted: boolean;
   verified: boolean;
   createdAt: string;
+  updatedAt: string;
   lastSeenAt: string;
 }
 
@@ -106,6 +107,7 @@ export interface Group {
   coverImage: string;
   verified: boolean;
   createdAt: string;
+  updatedAt: string;
 }
 
 export interface GroupMember {
