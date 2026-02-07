@@ -309,7 +309,7 @@ export type SyncEvent = {
   updatedAt?: string | null;
 };
 
-export const loadRemoteDb = async (): Promise<RemoteLoadResult> => {
+export const loadRemoteDb = async (signal?: AbortSignal): Promise<RemoteLoadResult> => {
   if (typeof window === 'undefined') {
     return { ok: false, exists: false, state: null, revision: 0 };
   }
@@ -317,6 +317,7 @@ export const loadRemoteDb = async (): Promise<RemoteLoadResult> => {
     const response = await fetch(REMOTE_URL, {
       method: 'GET',
       headers: { Accept: 'application/json' },
+      signal,
     });
     if (!response.ok) {
       return { ok: false, exists: false, state: null, revision: 0 };
@@ -334,6 +335,9 @@ export const loadRemoteDb = async (): Promise<RemoteLoadResult> => {
     }
     return { ok: true, exists: true, state: normalizeDb(raw), revision };
   } catch (error) {
+    if ((error as Error)?.name === 'AbortError') {
+      return { ok: false, exists: false, state: null, revision: 0 };
+    }
     console.warn('Remote DB is unavailable. Using local storage only.', error);
     return { ok: false, exists: false, state: null, revision: 0 };
   }
@@ -341,7 +345,8 @@ export const loadRemoteDb = async (): Promise<RemoteLoadResult> => {
 
 export const persistRemoteDb = async (
   state: SocialDb,
-  revision: number
+  revision: number,
+  signal?: AbortSignal
 ): Promise<RemotePersistResult> => {
   if (typeof window === 'undefined') {
     return { ok: false, conflict: false, revision, state: null };
@@ -351,6 +356,7 @@ export const persistRemoteDb = async (
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ state: stateForRemote(state), revision }),
+      signal,
     });
     if (response.status === 409) {
       const payload = (await response.json()) as {
@@ -375,6 +381,9 @@ export const persistRemoteDb = async (
       state: null,
     };
   } catch (error) {
+    if ((error as Error)?.name === 'AbortError') {
+      return { ok: false, conflict: false, revision, state: null };
+    }
     console.warn('Failed to push state to remote DB.', error);
     return { ok: false, conflict: false, revision, state: null };
   }

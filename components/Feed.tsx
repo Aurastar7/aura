@@ -57,7 +57,6 @@ const Feed: React.FC<FeedProps> = ({
 
   const [activeStoryIndex, setActiveStoryIndex] = useState<number | null>(null);
   const [storyReply, setStoryReply] = useState('');
-  const [storyProgress, setStoryProgress] = useState(0);
 
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -126,31 +125,15 @@ const Feed: React.FC<FeedProps> = ({
   const activeStory = activeStoryIndex === null ? null : stories[activeStoryIndex] ?? null;
 
   useEffect(() => {
-    if (!activeStory || activeStory.mediaType === 'video') {
-      setStoryProgress(0);
-      return;
-    }
-
-    setStoryProgress(0);
-    const durationMs = 7000;
-    const stepMs = 100;
-    const steps = durationMs / stepMs;
-    let current = 0;
-
-    const timer = window.setInterval(() => {
-      current += 1;
-      setStoryProgress((current / steps) * 100);
-      if (current >= steps) {
-        window.clearInterval(timer);
-        setActiveStoryIndex((index) => {
-          if (index === null) return null;
-          return index + 1 < stories.length ? index + 1 : null;
-        });
-      }
-    }, stepMs);
-
-    return () => window.clearInterval(timer);
-  }, [activeStory, stories.length]);
+    if (!activeStory || activeStory.mediaType === 'video') return;
+    const timer = window.setTimeout(() => {
+      setActiveStoryIndex((index) => {
+        if (index === null) return null;
+        return index + 1 < stories.length ? index + 1 : null;
+      });
+    }, 7000);
+    return () => window.clearTimeout(timer);
+  }, [activeStory?.id, activeStory?.mediaType, stories.length]);
 
   const submitStoryReply = (event: React.FormEvent) => {
     event.preventDefault();
@@ -321,7 +304,9 @@ const Feed: React.FC<FeedProps> = ({
         <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
           <div className="w-full max-w-3xl rounded-3xl overflow-hidden border border-slate-200 dark:border-slate-800 bg-white dark:bg-black">
             <div className="h-1 bg-slate-200 dark:bg-slate-800">
-              <div className="h-full bg-slate-900 dark:bg-white transition-all" style={{ width: `${storyProgress}%` }} />
+              {activeStory.mediaType !== 'video' ? (
+                <div key={activeStory.id} className="h-full bg-slate-900 dark:bg-white story-progress" />
+              ) : null}
             </div>
 
             <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">

@@ -33,20 +33,37 @@ const Layout: React.FC<LayoutProps> = ({
   onCompose,
 }) => {
   useEffect(() => {
+    const root = document.documentElement;
+    let timer: number | null = null;
+
     const applyViewportHeight = () => {
-      const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
-      document.documentElement.style.setProperty('--app-height', `${viewportHeight}px`);
+      const height = window.innerHeight;
+      const nextVh = `${height * 0.01}px`;
+      const nextAppHeight = `${height}px`;
+      if (root.style.getPropertyValue('--vh') !== nextVh) {
+        root.style.setProperty('--vh', nextVh);
+      }
+      if (root.style.getPropertyValue('--app-height') !== nextAppHeight) {
+        root.style.setProperty('--app-height', nextAppHeight);
+      }
+    };
+
+    const scheduleViewportHeight = () => {
+      if (timer) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        applyViewportHeight();
+      }, 120);
     };
 
     applyViewportHeight();
-    window.addEventListener('resize', applyViewportHeight);
-    window.addEventListener('orientationchange', applyViewportHeight);
-    window.visualViewport?.addEventListener('resize', applyViewportHeight);
+    window.addEventListener('resize', scheduleViewportHeight, { passive: true });
+    window.addEventListener('orientationchange', scheduleViewportHeight, { passive: true });
 
     return () => {
-      window.removeEventListener('resize', applyViewportHeight);
-      window.removeEventListener('orientationchange', applyViewportHeight);
-      window.visualViewport?.removeEventListener('resize', applyViewportHeight);
+      if (timer) window.clearTimeout(timer);
+      window.removeEventListener('resize', scheduleViewportHeight);
+      window.removeEventListener('orientationchange', scheduleViewportHeight);
     };
   }, []);
 
@@ -80,7 +97,7 @@ const Layout: React.FC<LayoutProps> = ({
           />
         </aside>
 
-        <main className="w-full min-w-0 max-w-none xl:max-w-3xl border-r-0 xl:border-r-2 border-slate-200 dark:border-slate-800 min-h-[var(--app-height)] bg-white dark:bg-black pt-14 lg:pt-0 pb-[calc(env(safe-area-inset-bottom)+72px)] lg:pb-0">
+        <main className="w-full min-w-0 max-w-none xl:max-w-3xl border-r-0 xl:border-r-2 border-slate-200 dark:border-slate-800 min-h-[var(--app-height)] bg-white dark:bg-black pt-[calc(env(safe-area-inset-top)+56px)] lg:pt-0 pb-[calc(env(safe-area-inset-bottom)+72px)] lg:pb-0">
           {children}
         </main>
 
@@ -89,7 +106,7 @@ const Layout: React.FC<LayoutProps> = ({
         </aside>
       </div>
 
-      <div className="lg:hidden fixed top-0 inset-x-0 z-40 border-b-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black px-4 py-3 flex items-center justify-between">
+      <div className="lg:hidden fixed top-0 inset-x-0 z-40 border-b-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black px-4 py-3 pt-[calc(env(safe-area-inset-top)+12px)] flex items-center justify-between">
         <button onClick={() => onChangeView('feed')} className="w-10 h-10 rounded-xl bg-slate-900 dark:bg-white dark:text-black text-white font-black grid place-items-center">A</button>
         <div className="flex items-center gap-2">
           <button onClick={onCompose} className="w-9 h-9 rounded-xl bg-slate-900 dark:bg-white dark:text-black text-white grid place-items-center">

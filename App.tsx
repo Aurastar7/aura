@@ -82,6 +82,8 @@ const App: React.FC = () => {
   const [composeSignal, setComposeSignal] = useState(0);
   const seenNotifIds = useRef<Set<string>>(new Set());
   const seenMessageIds = useRef<Set<string>>(new Set());
+  const usersByIdRef = useRef<Record<string, typeof db.users[number]>>({});
+  const toastTimersRef = useRef<number[]>([]);
   const setCurrentViewRef = useRef(setCurrentView);
   const setActiveGroupRef = useRef(setActiveGroup);
 
@@ -98,10 +100,26 @@ const App: React.FC = () => {
     setActiveGroupRef.current = setActiveGroup;
   }, [setCurrentView, setActiveGroup]);
 
+  useEffect(() => {
+    usersByIdRef.current = usersById;
+  }, [usersById]);
+
+  useEffect(
+    () => () => {
+      toastTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+      toastTimersRef.current = [];
+    },
+    []
+  );
+
   const setHash = (value: string) => {
     const next = value.startsWith('#') ? value : `#${value}`;
     if (window.location.hash === next) return;
     window.history.replaceState(null, '', next);
+  };
+
+  const clearTrackedTimer = (id: number) => {
+    toastTimersRef.current = toastTimersRef.current.filter((timer) => timer !== id);
   };
 
   const pushToast = (ok: boolean, text: string, actorId?: string) => {
@@ -123,20 +141,24 @@ const App: React.FC = () => {
       gain.connect(ctx.destination);
       oscillator.start();
       oscillator.stop(ctx.currentTime + 0.22);
-      window.setTimeout(() => {
+      const closeTimer = window.setTimeout(() => {
+        clearTrackedTimer(closeTimer);
         void ctx.close();
       }, 350);
+      toastTimersRef.current.push(closeTimer);
     } catch {
       // ignore audio errors in restricted browser contexts
     }
 
-    window.setTimeout(() => {
+    const removeTimer = window.setTimeout(() => {
+      clearTrackedTimer(removeTimer);
       setToasts((prev) => prev.filter((item) => item.id !== id));
     }, 3800);
+    toastTimersRef.current.push(removeTimer);
   };
 
   useEffect(() => {
-    if (!user) {
+    if (!user?.id) {
       seenNotifIds.current.clear();
       return;
     }
@@ -153,10 +175,10 @@ const App: React.FC = () => {
     });
 
     seenNotifIds.current = currentIds;
-  }, [notifications, user]);
+  }, [notifications, user?.id]);
 
   useEffect(() => {
-    if (!user) {
+    if (!user?.id) {
       seenMessageIds.current.clear();
       return;
     }
@@ -169,11 +191,11 @@ const App: React.FC = () => {
     messages.forEach((item) => {
       if (item.toId !== user.id) return;
       if (seenMessageIds.current.has(item.id)) return;
-      const sender = usersById[item.fromId];
+      const sender = usersByIdRef.current[item.fromId];
       pushToast(true, `${sender?.displayName || 'User'} sent a message.`, item.fromId);
     });
     seenMessageIds.current = currentIds;
-  }, [messages, user, usersById]);
+  }, [messages, user?.id]);
 
   useEffect(() => {
     const applyHash = () => {

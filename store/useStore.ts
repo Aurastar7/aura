@@ -220,6 +220,12 @@ export function useStore(): UseStore {
   const remoteRevisionRef = useRef(0);
   const remoteFailCountRef = useRef(0);
   const pushingRef = useRef(false);
+  const bootstrappingRef = useRef(false);
+  const pullingRef = useRef(false);
+  const bootstrapAbortRef = useRef<AbortController | null>(null);
+  const pushAbortRef = useRef<AbortController | null>(null);
+  const pullAbortRef = useRef<AbortController | null>(null);
+  const lastPresenceUpdateRef = useRef(0);
   const dbRef = useRef(db);
 
   if (!startupHashRef.current) {
@@ -278,7 +284,13 @@ export function useStore(): UseStore {
     if (remoteSynced || !remoteEnabled) return;
     let cancelled = false;
     const bootstrap = async () => {
-      const remote = await loadRemoteDb();
+      if (bootstrappingRef.current) return;
+      bootstrappingRef.current = true;
+      bootstrapAbortRef.current?.abort();
+      const controller = new AbortController();
+      bootstrapAbortRef.current = controller;
+      const remote = await loadRemoteDb(controller.signal);
+      bootstrappingRef.current = false;
       if (cancelled) return;
       if (!remote.ok) {
         remoteFailCountRef.current += 1;
@@ -294,10 +306,18 @@ export function useStore(): UseStore {
         const localNow = dbRef.current;
         const localHash = syncFingerprint(localNow);
         const remoteHash = syncFingerprint(remote.state);
+        if (localHash === remoteHash) {
+          syncHashRef.current = remoteHash;
+          setRemoteSynced(true);
+          return;
+        }
         if (localHash !== startupHashRef.current && localHash !== remoteHash) {
           const merged = mergeDb(localNow, remote.state as SocialDb);
           setDb((prev) => withLocalSession(merged, prev));
-          const pushed = await persistRemoteDb(merged, remote.revision);
+          pushAbortRef.current?.abort();
+          const pushController = new AbortController();
+          pushAbortRef.current = pushController;
+          const pushed = await persistRemoteDb(merged, remote.revision, pushController.signal);
           if (pushed.ok) {
             remoteRevisionRef.current = pushed.revision;
             syncHashRef.current = syncFingerprint(merged);
@@ -312,7 +332,10 @@ export function useStore(): UseStore {
           setDb((prev) => withLocalSession(remote.state as SocialDb, prev));
         }
       } else {
-        const pushed = await persistRemoteDb(dbRef.current, remote.revision);
+        pushAbortRef.current?.abort();
+        const pushController = new AbortController();
+        pushAbortRef.current = pushController;
+        const pushed = await persistRemoteDb(dbRef.current, remote.revision, pushController.signal);
         if (pushed.ok) {
           remoteRevisionRef.current = pushed.revision;
           syncHashRef.current = syncFingerprint(dbRef.current);
@@ -325,10 +348,12 @@ export function useStore(): UseStore {
     const timer = window.setInterval(() => {
       if (remoteSynced || !remoteEnabled) return;
       void bootstrap();
-    }, 2500);
+    }, 5000);
 
     return () => {
       cancelled = true;
+      bootstrapAbortRef.current?.abort();
+      pushAbortRef.current?.abort();
       window.clearInterval(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -343,7 +368,10 @@ export function useStore(): UseStore {
 
     const timer = window.setTimeout(async () => {
       pushingRef.current = true;
-      const pushed = await persistRemoteDb(db, remoteRevisionRef.current);
+      pushAbortRef.current?.abort();
+      const controller = new AbortController();
+      pushAbortRef.current = controller;
+      const pushed = await persistRemoteDb(db, remoteRevisionRef.current, controller.signal);
       pushingRef.current = false;
       if (pushed.ok) {
         remoteRevisionRef.current = pushed.revision;
@@ -358,7 +386,10 @@ export function useStore(): UseStore {
       }
     }, 120);
 
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      pushAbortRef.current?.abort();
+    };
   }, [db, remoteEnabled, remoteSynced]);
 
   useEffect(() => {
@@ -366,7 +397,13 @@ export function useStore(): UseStore {
 
     const pullRemote = async () => {
       if (pushingRef.current) return;
-      const remote = await loadRemoteDb();
+      if (pullingRef.current) return;
+      pullingRef.current = true;
+      pullAbortRef.current?.abort();
+      const controller = new AbortController();
+      pullAbortRef.current = controller;
+      const remote = await loadRemoteDb(controller.signal);
+      pullingRef.current = false;
       if (!remote.ok || !remote.state) return;
       remoteRevisionRef.current = remote.revision;
       const remoteHash = syncFingerprint(remote.state);
@@ -387,6 +424,7 @@ export function useStore(): UseStore {
     }, 8000);
 
     return () => {
+      pullAbortRef.current?.abort();
       disconnectSocket();
       window.clearInterval(timer);
     };
@@ -402,28 +440,39 @@ export function useStore(): UseStore {
 
   useEffect(() => {
     if (!user || !user.banned) return;
-    setDb((prev) => ({
-      ...prev,
-      session: {
-        ...prev.session,
-        userId: null,
-        currentView: 'feed',
-        activeChatUserId: null,
-      },
-    }));
+    setDb((prev) => {
+      if (prev.session.userId !== user.id) return prev;
+      return {
+        ...prev,
+        session: {
+          ...prev.session,
+          userId: null,
+          currentView: 'feed',
+          activeChatUserId: null,
+        },
+      };
+    });
   }, [user]);
 
   useEffect(() => {
     if (!user) return;
     const touch = () => {
-      setDb((prev) => ({
-        ...prev,
-        users: prev.users.map((candidate) =>
-          candidate.id === user.id
-            ? { ...candidate, lastSeenAt: new Date().toISOString() }
-            : candidate
-        ),
-      }));
+      const nowMs = Date.now();
+      if (nowMs - lastPresenceUpdateRef.current < 25000) return;
+      const nowIso = new Date(nowMs).toISOString();
+      setDb((prev) => {
+        const index = prev.users.findIndex((candidate) => candidate.id === user.id);
+        if (index < 0) return prev;
+        const target = prev.users[index];
+        if (nowMs - new Date(target.lastSeenAt || 0).getTime() < 25000) return prev;
+        const nextUsers = [...prev.users];
+        nextUsers[index] = { ...target, lastSeenAt: nowIso };
+        lastPresenceUpdateRef.current = nowMs;
+        return {
+          ...prev,
+          users: nextUsers,
+        };
+      });
     };
 
     touch();
@@ -440,13 +489,17 @@ export function useStore(): UseStore {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      setDb((prev) => ({
-        ...prev,
-        messages: prev.messages.filter((message) => {
+      setDb((prev) => {
+        const nextMessages = prev.messages.filter((message) => {
           if (message.mediaType !== 'voice' || !message.expiresAt) return true;
           return new Date(message.expiresAt).getTime() > Date.now();
-        }),
-      }));
+        });
+        if (nextMessages.length === prev.messages.length) return prev;
+        return {
+          ...prev,
+          messages: nextMessages,
+        };
+      });
     }, 60000);
 
     return () => window.clearInterval(timer);

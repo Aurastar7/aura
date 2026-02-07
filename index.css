@@ -1,6 +1,7 @@
 :root {
   color-scheme: light;
-  --app-height: 100vh;
+  --vh: 1vh;
+  --app-height: calc(var(--vh) * 100);
 }
 
 html.dark {
@@ -64,4 +65,18 @@ html.dark .glass {
 
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+@keyframes storyProgress {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+.story-progress {
+  transform-origin: left center;
+  animation: storyProgress 7s linear forwards;
 }
