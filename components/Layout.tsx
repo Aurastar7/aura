@@ -63,9 +63,9 @@ const Layout: React.FC<LayoutProps> = ({
   };
 
   return (
-    <div className="min-h-[var(--app-height)] w-full overflow-x-hidden bg-slate-50 dark:bg-black transition-colors">
-      <div className="min-h-[var(--app-height)] w-full max-w-[1440px] mx-auto flex items-start justify-center">
-        <div className="hidden lg:block w-72 shrink-0 self-start sticky top-0 h-[var(--app-height)] border-r-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black">
+    <div className="min-h-[var(--app-height)] w-full bg-slate-50 dark:bg-black transition-colors">
+      <div className="min-h-[var(--app-height)] w-full max-w-[1440px] mx-auto grid grid-cols-1 lg:grid-cols-[288px_minmax(0,1fr)] xl:grid-cols-[288px_minmax(0,1fr)_384px]">
+        <aside className="hidden lg:block sticky top-0 h-[var(--app-height)] border-r-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black">
           <Sidebar
             user={user}
             currentView={currentView}
@@ -78,15 +78,15 @@ const Layout: React.FC<LayoutProps> = ({
             onLogout={onLogout}
             onCompose={onCompose}
           />
-        </div>
+        </aside>
 
-        <main className="flex-1 w-full max-w-3xl border-r-0 xl:border-r-2 border-slate-200 dark:border-slate-800 min-h-screen bg-white dark:bg-black pt-14 lg:pt-0 pb-[calc(env(safe-area-inset-bottom)+72px)] lg:pb-0">
+        <main className="w-full min-w-0 max-w-none xl:max-w-3xl border-r-0 xl:border-r-2 border-slate-200 dark:border-slate-800 min-h-[var(--app-height)] bg-white dark:bg-black pt-14 lg:pt-0 pb-[calc(env(safe-area-inset-bottom)+72px)] lg:pb-0">
           {children}
         </main>
 
-        <div className="hidden xl:block w-80 xl:w-96 shrink-0 self-start sticky top-0 h-[var(--app-height)] p-4 overflow-y-auto bg-slate-50 dark:bg-black">
+        <aside className="hidden xl:block sticky top-0 h-[var(--app-height)] p-4 overflow-y-auto bg-slate-50 dark:bg-black">
           {rightPanel}
-        </div>
+        </aside>
       </div>
 
       <div className="lg:hidden fixed top-0 inset-x-0 z-40 border-b-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black px-4 py-3 flex items-center justify-between">

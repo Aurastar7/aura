@@ -161,7 +161,7 @@ const Feed: React.FC<FeedProps> = ({
 
   return (
     <div className="flex flex-col divide-y divide-slate-100 dark:divide-slate-800">
-      <div className="sticky top-0 z-10 glass px-6 py-4 flex items-center justify-between border-b-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black">
+      <div className="sticky top-14 lg:top-0 z-10 glass px-6 py-4 flex items-center justify-between border-b-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-black">
         <h1 className="text-xl font-bold dark:text-white">Feed</h1>
         <div className="flex items-center gap-4 text-sm font-medium">
           <button

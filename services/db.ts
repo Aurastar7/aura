@@ -277,6 +277,8 @@ export const resetDb = () => {
 
 export const stateForRemote = (state: SocialDb): SocialDb => ({
   ...state,
+  // Theme is a device-local preference; do not let clients overwrite each other.
+  theme: 'light',
   session: {
     userId: null,
     currentView: 'feed',
@@ -391,10 +393,14 @@ export const connectSyncSocket = (onEvent: (event: SyncEvent) => void) => {
 
   let socket: WebSocket | null = null;
   let reconnectTimer: number | null = null;
+  let reconnectDelayMs = 700;
   let isClosed = false;
 
   const open = () => {
     socket = new WebSocket(REMOTE_WS_URL);
+    socket.onopen = () => {
+      reconnectDelayMs = 700;
+    };
     socket.onmessage = (message) => {
       try {
         const payload = JSON.parse(message.data as string) as SyncEvent;
@@ -407,7 +413,8 @@ export const connectSyncSocket = (onEvent: (event: SyncEvent) => void) => {
     };
     socket.onclose = () => {
       if (isClosed) return;
-      reconnectTimer = window.setTimeout(open, 700);
+      reconnectTimer = window.setTimeout(open, reconnectDelayMs);
+      reconnectDelayMs = Math.min(Math.floor(reconnectDelayMs * 1.8), 8000);
     };
     socket.onerror = () => {
       socket?.close();

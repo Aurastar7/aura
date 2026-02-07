@@ -213,10 +213,12 @@ const mergeDb = (local: SocialDb, remote: SocialDb): SocialDb => ({
 
 export function useStore(): UseStore {
   const [db, setDb] = useState<SocialDb>(() => loadDb());
+  const [remoteEnabled, setRemoteEnabled] = useState(true);
   const [remoteSynced, setRemoteSynced] = useState(false);
   const syncHashRef = useRef<string>('');
   const startupHashRef = useRef<string>('');
   const remoteRevisionRef = useRef(0);
+  const remoteFailCountRef = useRef(0);
   const pushingRef = useRef(false);
   const dbRef = useRef(db);
 
@@ -273,11 +275,20 @@ export function useStore(): UseStore {
   );
 
   useEffect(() => {
-    if (remoteSynced) return;
+    if (remoteSynced || !remoteEnabled) return;
     let cancelled = false;
     const bootstrap = async () => {
       const remote = await loadRemoteDb();
-      if (cancelled || !remote.ok) return;
+      if (cancelled) return;
+      if (!remote.ok) {
+        remoteFailCountRef.current += 1;
+        if (remoteFailCountRef.current >= 3) {
+          setRemoteEnabled(false);
+          setRemoteSynced(true);
+        }
+        return;
+      }
+      remoteFailCountRef.current = 0;
       remoteRevisionRef.current = remote.revision;
       if (remote.state) {
         const localNow = dbRef.current;
@@ -312,20 +323,20 @@ export function useStore(): UseStore {
 
     void bootstrap();
     const timer = window.setInterval(() => {
-      if (remoteSynced) return;
+      if (remoteSynced || !remoteEnabled) return;
       void bootstrap();
-    }, 1200);
+    }, 2500);
 
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [remoteSynced]);
+  }, [remoteEnabled, remoteSynced]);
 
   useEffect(() => {
     persistDb(db);
-    if (!remoteSynced) return;
+    if (!remoteSynced || !remoteEnabled) return;
 
     const nextHash = syncFingerprint(db);
     if (nextHash === syncHashRef.current) return;
@@ -345,13 +356,13 @@ export function useStore(): UseStore {
         syncHashRef.current = syncFingerprint(merged);
         setDb((prev) => withLocalSession(merged, prev));
       }
-    }, 60);
+    }, 120);
 
     return () => window.clearTimeout(timer);
-  }, [db, remoteSynced]);
+  }, [db, remoteEnabled, remoteSynced]);
 
   useEffect(() => {
-    if (!remoteSynced) return;
+    if (!remoteSynced || !remoteEnabled) return;
 
     const pullRemote = async () => {
       if (pushingRef.current) return;
@@ -373,13 +384,13 @@ export function useStore(): UseStore {
 
     const timer = window.setInterval(() => {
       void pullRemote();
-    }, 1500);
+    }, 8000);
 
     return () => {
       disconnectSocket();
       window.clearInterval(timer);
     };
-  }, [remoteSynced]);
+  }, [remoteEnabled, remoteSynced]);
 
   useEffect(() => {
     if (db.theme === 'dark') {
