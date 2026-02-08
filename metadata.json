@@ -1,7 +1,0 @@
-{
-  "name": "Aura Social",
-  "description": "A premium social experience focused on identity, moments, and fluid interactions. Inspired by X but reimagined with a modern, organic design language.",
-  "requestFramePermissions": [
-    "camera"
-  ]
-}
