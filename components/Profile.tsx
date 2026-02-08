@@ -113,7 +113,17 @@ const Profile: React.FC<ProfileProps> = ({
     event.target.value = '';
   };
 
-  const userPosts = useMemo(() => posts.filter((post) => post.authorId === profileUser.id), [posts, profileUser.id]);
+  const userPosts = useMemo(() => {
+    const authored = posts.filter((post) => post.authorId === profileUser.id);
+    const seenGroupReposts = new Set<string>();
+    return authored.filter((post) => {
+      if (!post.repostOfGroupPostId) return true;
+      const key = `${post.authorId}:${post.repostOfGroupPostId}`;
+      if (seenGroupReposts.has(key)) return false;
+      seenGroupReposts.add(key);
+      return true;
+    });
+  }, [posts, profileUser.id]);
   const userStoriesCount = useMemo(() => stories.filter((story) => story.authorId === profileUser.id).length, [stories, profileUser.id]);
   const followers = follows.filter((item) => item.followingId === profileUser.id).length;
   const following = follows.filter((item) => item.followerId === profileUser.id).length;

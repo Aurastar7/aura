@@ -1429,17 +1429,18 @@ export function useStore(): UseStore {
     const group = db.groups.find((candidate) => candidate.id === source.groupId);
     if (!group) return fail('Group not found.');
     if (!canManageGroup(group)) return fail('Only group admin can publish this post to main wall.');
-    const sourceAuthor = db.users.find((candidate) => candidate.id === source.authorId);
 
     const post: Post = {
       id: makeId('post'),
-      authorId: user.id,
-      text: `[${group.name}] ${sourceAuthor?.displayName || 'User'}: ${source.text}`.trim(),
+      authorId: source.authorId,
+      text: source.text,
       mediaType: source.mediaType,
       mediaUrl: source.mediaUrl,
       createdAt: new Date().toISOString(),
       likedBy: [],
       repostedBy: [],
+      repostOfGroupPostId: source.id,
+      repostSourceGroupId: group.id,
     };
 
     setDb((prev) => ({

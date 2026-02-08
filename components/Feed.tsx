@@ -126,9 +126,18 @@ const Feed: React.FC<FeedProps> = ({
       );
     });
 
-    return [...searched].sort(
+    const sorted = [...searched].sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
     );
+
+    const seenGroupReposts = new Set<string>();
+    return sorted.filter((post) => {
+      if (!post.repostOfGroupPostId) return true;
+      const key = `${post.authorId}:${post.repostOfGroupPostId}`;
+      if (seenGroupReposts.has(key)) return false;
+      seenGroupReposts.add(key);
+      return true;
+    });
   }, [activeHashtag, posts, searchQuery, usersById]);
 
   useEffect(() => {

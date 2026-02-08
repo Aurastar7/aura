@@ -55,6 +55,7 @@ const Messages: React.FC<MessagesProps> = ({
     fit: 'contain' | 'cover';
   } | null>(null);
   const onMarkChatReadRef = useRef(onMarkChatRead);
+  const conversationRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     onMarkChatReadRef.current = onMarkChatRead;
@@ -90,6 +91,15 @@ const Messages: React.FC<MessagesProps> = ({
       )
       .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
   }, [messages, currentUser.id, activeChatUser]);
+
+  useEffect(() => {
+    if (!activeChatUserId) return;
+    const container = conversationRef.current;
+    if (!container) return;
+    requestAnimationFrame(() => {
+      container.scrollTop = container.scrollHeight;
+    });
+  }, [activeChatUserId, conversation.length]);
 
   const resetDraft = () => {
     setText('');
@@ -212,7 +222,7 @@ const Messages: React.FC<MessagesProps> = ({
         </button>
       </div>
 
-      <div className="flex-1 min-h-0 px-4 py-4 space-y-2 overflow-y-auto">
+      <div ref={conversationRef} className="flex-1 min-h-0 px-4 py-4 space-y-2 overflow-y-auto">
         {conversation.length > 0 ? (
           conversation.map((message) => {
             const isMine = message.fromId === currentUser.id;
