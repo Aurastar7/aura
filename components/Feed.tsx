@@ -21,11 +21,14 @@ interface FeedProps {
   onTogglePostRepost: (postId: string) => void;
   onDeletePost: (postId: string) => void;
   onAddPostComment: (postId: string, text: string) => void;
+  onEditPostComment: (commentId: string, text: string) => void;
+  onDeletePostComment: (commentId: string) => void;
   onCreateStory: (caption: string, mediaType: MediaType, mediaUrl: string) => void;
   onDeleteStory: (storyId: string) => void;
   onAddStoryComment: (storyId: string, text: string) => void;
   onOpenProfile: (userId: string) => void;
   onOpenHashtag: (tag: string) => void;
+  onOpenGroup: (groupId: string) => void;
   onClearHashtag: () => void;
 }
 
@@ -55,11 +58,14 @@ const Feed: React.FC<FeedProps> = ({
   onTogglePostRepost,
   onDeletePost,
   onAddPostComment,
+  onEditPostComment,
+  onDeletePostComment,
   onCreateStory,
   onDeleteStory,
   onAddStoryComment,
   onOpenProfile,
   onOpenHashtag,
+  onOpenGroup,
   onClearHashtag,
 }) => {
   const [newPostContent, setNewPostContent] = useState('');
@@ -402,8 +408,11 @@ const Feed: React.FC<FeedProps> = ({
               onToggleRepost={onTogglePostRepost}
               onDeletePost={onDeletePost}
               onAddComment={onAddPostComment}
+              onEditComment={onEditPostComment}
+              onDeleteComment={onDeletePostComment}
               onOpenProfile={onOpenProfile}
               onOpenHashtag={onOpenHashtag}
+              onOpenGroup={onOpenGroup}
             />
           );
         })}

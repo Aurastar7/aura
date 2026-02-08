@@ -69,6 +69,8 @@ type UseStore = {
   togglePostLike: (postId: string) => ActionResult;
   togglePostRepost: (postId: string) => ActionResult;
   addPostComment: (postId: string, text: string) => ActionResult;
+  editPostComment: (commentId: string, text: string) => ActionResult;
+  deletePostComment: (commentId: string) => ActionResult;
   togglePostCommentLike: (commentId: string) => ActionResult;
   createStory: (payload: StoryPayload) => ActionResult;
   deleteStory: (storyId: string) => ActionResult;
@@ -100,6 +102,8 @@ type UseStore = {
   editGroupPost: (groupPostId: string, text: string) => ActionResult;
   deleteGroupPost: (groupPostId: string) => ActionResult;
   addGroupPostComment: (groupPostId: string, text: string) => ActionResult;
+  editGroupPostComment: (commentId: string, text: string) => ActionResult;
+  deleteGroupPostComment: (commentId: string) => ActionResult;
   toggleGroupPostCommentLike: (commentId: string) => ActionResult;
   setUserRole: (userId: string, role: UserRole) => ActionResult;
   setUserBan: (userId: string, banned: boolean) => ActionResult;
@@ -851,6 +855,37 @@ export function useStore(): UseStore {
     return ok('Comment added.');
   };
 
+  const editPostComment = (commentId: string, text: string): ActionResult => {
+    if (!user) return fail('Please login first.');
+    const target = db.postComments.find((comment) => comment.id === commentId);
+    if (!target) return fail('Comment not found.');
+    if (user.role !== 'admin' && target.authorId !== user.id) return fail('Not allowed.');
+
+    const nextText = text.trim();
+    if (!nextText) return fail('Comment is empty.');
+
+    setDb((prev) => ({
+      ...prev,
+      postComments: prev.postComments.map((comment) =>
+        comment.id === commentId ? { ...comment, text: nextText } : comment
+      ),
+    }));
+    return ok('Comment updated.');
+  };
+
+  const deletePostComment = (commentId: string): ActionResult => {
+    if (!user) return fail('Please login first.');
+    const target = db.postComments.find((comment) => comment.id === commentId);
+    if (!target) return fail('Comment not found.');
+    if (user.role !== 'admin' && target.authorId !== user.id) return fail('Not allowed.');
+
+    setDb((prev) => ({
+      ...prev,
+      postComments: prev.postComments.filter((comment) => comment.id !== commentId),
+    }));
+    return ok('Comment deleted.');
+  };
+
   const togglePostCommentLike = (commentId: string): ActionResult => {
     if (!user) return fail('Please login first.');
     const target = db.postComments.find((comment) => comment.id === commentId);
@@ -1501,6 +1536,49 @@ export function useStore(): UseStore {
     return ok('Comment added to group post.');
   };
 
+  const editGroupPostComment = (commentId: string, text: string): ActionResult => {
+    if (!user) return fail('Please login first.');
+    const target = db.groupPostComments.find((comment) => comment.id === commentId);
+    if (!target) return fail('Comment not found.');
+    const groupPost = db.groupPosts.find((post) => post.id === target.groupPostId);
+    const group = groupPost ? db.groups.find((item) => item.id === groupPost.groupId) : null;
+    const canManage =
+      user.role === 'admin' ||
+      target.authorId === user.id ||
+      (group && group.adminId === user.id);
+    if (!canManage) return fail('Not allowed.');
+
+    const nextText = text.trim();
+    if (!nextText) return fail('Comment is empty.');
+
+    setDb((prev) => ({
+      ...prev,
+      groupPostComments: prev.groupPostComments.map((comment) =>
+        comment.id === commentId ? { ...comment, text: nextText } : comment
+      ),
+    }));
+    return ok('Comment updated.');
+  };
+
+  const deleteGroupPostComment = (commentId: string): ActionResult => {
+    if (!user) return fail('Please login first.');
+    const target = db.groupPostComments.find((comment) => comment.id === commentId);
+    if (!target) return fail('Comment not found.');
+    const groupPost = db.groupPosts.find((post) => post.id === target.groupPostId);
+    const group = groupPost ? db.groups.find((item) => item.id === groupPost.groupId) : null;
+    const canManage =
+      user.role === 'admin' ||
+      target.authorId === user.id ||
+      (group && group.adminId === user.id);
+    if (!canManage) return fail('Not allowed.');
+
+    setDb((prev) => ({
+      ...prev,
+      groupPostComments: prev.groupPostComments.filter((comment) => comment.id !== commentId),
+    }));
+    return ok('Comment deleted.');
+  };
+
   const toggleGroupPostCommentLike = (commentId: string): ActionResult => {
     if (!user) return fail('Please login first.');
     const target = db.groupPostComments.find((comment) => comment.id === commentId);
@@ -1673,6 +1751,8 @@ export function useStore(): UseStore {
     togglePostLike,
     togglePostRepost,
     addPostComment,
+    editPostComment,
+    deletePostComment,
     togglePostCommentLike,
     createStory,
     deleteStory,
@@ -1696,6 +1776,8 @@ export function useStore(): UseStore {
     editGroupPost,
     deleteGroupPost,
     addGroupPostComment,
+    editGroupPostComment,
+    deleteGroupPostComment,
     toggleGroupPostCommentLike,
     setUserRole,
     setUserBan,

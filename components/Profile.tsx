@@ -21,8 +21,11 @@ interface ProfileProps {
   onTogglePostRepost: (postId: string) => void;
   onDeletePost: (postId: string) => void;
   onAddPostComment: (postId: string, text: string) => void;
+  onEditPostComment: (commentId: string, text: string) => void;
+  onDeletePostComment: (commentId: string) => void;
   onOpenProfile: (userId: string) => void;
   onOpenHashtag: (tag: string) => void;
+  onOpenGroup: (groupId: string) => void;
   onCopyProfileLink: (link: string) => void;
   onBack: () => void;
 }
@@ -52,8 +55,11 @@ const Profile: React.FC<ProfileProps> = ({
   onTogglePostRepost,
   onDeletePost,
   onAddPostComment,
+  onEditPostComment,
+  onDeletePostComment,
   onOpenProfile,
   onOpenHashtag,
+  onOpenGroup,
   onCopyProfileLink,
   onBack,
 }) => {
@@ -219,22 +225,22 @@ const Profile: React.FC<ProfileProps> = ({
 
           <div className="ml-auto min-w-0 flex-1 flex flex-wrap justify-end gap-1.5 sm:gap-2">
             {isOwn ? (
-              <button onClick={() => setEditing((prev) => !prev)} className="border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 px-3 sm:px-4 py-2 rounded-xl sm:rounded-2xl text-sm sm:text-base font-bold text-slate-900 dark:text-white transition-colors leading-tight">
+              <button onClick={() => setEditing((prev) => !prev)} className="border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 px-2 sm:px-4 py-1.5 sm:py-2 rounded-xl sm:rounded-2xl text-[11px] sm:text-base font-bold text-slate-900 dark:text-white transition-colors leading-tight">
                 {editing ? 'Cancel' : 'Edit Profile'}
               </button>
             ) : (
               <>
-                <button onClick={() => onMessage(profileUser.id)} className="border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 px-3 sm:px-4 py-2 rounded-xl sm:rounded-2xl text-sm sm:text-base font-bold text-slate-900 dark:text-white transition-colors leading-tight">
+                <button onClick={() => onMessage(profileUser.id)} className="border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 px-2 sm:px-4 py-1.5 sm:py-2 rounded-xl sm:rounded-2xl text-[11px] sm:text-base font-bold text-slate-900 dark:text-white transition-colors leading-tight">
                   Message
                 </button>
-                <button onClick={() => onToggleFollow(profileUser.id)} className={`px-3 sm:px-4 py-2 rounded-xl sm:rounded-2xl text-sm sm:text-base font-bold transition-colors leading-tight ${isFollowing ? 'border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 text-slate-900 dark:text-white' : 'bg-slate-900 dark:bg-white dark:text-black text-white hover:bg-slate-800 dark:hover:bg-slate-200'}`}>
+                <button onClick={() => onToggleFollow(profileUser.id)} className={`px-2 sm:px-4 py-1.5 sm:py-2 rounded-xl sm:rounded-2xl text-[11px] sm:text-base font-bold transition-colors leading-tight ${isFollowing ? 'border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 text-slate-900 dark:text-white' : 'bg-slate-900 dark:bg-white dark:text-black text-white hover:bg-slate-800 dark:hover:bg-slate-200'}`}>
                   {isFollowing ? 'Following' : 'Follow'}
                 </button>
               </>
             )}
             <button
               onClick={() => onCopyProfileLink(`${window.location.origin}/#/u/${encodeURIComponent(profileUser.id)}`)}
-              className="border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 px-3 sm:px-4 py-2 rounded-xl sm:rounded-2xl text-sm sm:text-base font-bold text-slate-900 dark:text-white transition-colors leading-tight"
+              className="border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 px-2 sm:px-4 py-1.5 sm:py-2 rounded-xl sm:rounded-2xl text-[11px] sm:text-base font-bold text-slate-900 dark:text-white transition-colors leading-tight"
             >
               Copy link
             </button>
@@ -375,8 +381,11 @@ const Profile: React.FC<ProfileProps> = ({
               onToggleRepost={onTogglePostRepost}
               onDeletePost={onDeletePost}
               onAddComment={onAddPostComment}
+              onEditComment={onEditPostComment}
+              onDeleteComment={onDeletePostComment}
               onOpenProfile={onOpenProfile}
               onOpenHashtag={onOpenHashtag}
+              onOpenGroup={onOpenGroup}
             />
           ))}
 

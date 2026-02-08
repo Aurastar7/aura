@@ -51,6 +51,8 @@ const App: React.FC = () => {
     togglePostLike,
     togglePostRepost,
     addPostComment,
+    editPostComment,
+    deletePostComment,
     createStory,
     deleteStory,
     addStoryComment,
@@ -71,6 +73,8 @@ const App: React.FC = () => {
     editGroupPost,
     deleteGroupPost,
     addGroupPostComment,
+    editGroupPostComment,
+    deleteGroupPostComment,
     setUserRole,
     setUserBan,
     setUserRestricted,
@@ -459,6 +463,8 @@ const App: React.FC = () => {
             onTogglePostRepost={(postId) => showResult(togglePostRepost(postId))}
             onDeletePost={(postId) => showResult(deletePost(postId))}
             onAddPostComment={(postId, text) => showResult(addPostComment(postId, text))}
+            onEditPostComment={(commentId, text) => showResult(editPostComment(commentId, text))}
+            onDeletePostComment={(commentId) => showResult(deletePostComment(commentId))}
             onCreateStory={(caption, mediaType, mediaUrl) =>
               showResult(createStory({ caption, mediaType, mediaUrl }))
             }
@@ -466,6 +472,7 @@ const App: React.FC = () => {
             onAddStoryComment={(storyId, text) => showResult(addStoryComment(storyId, text))}
             onOpenProfile={openProfile}
             onOpenHashtag={openHashtag}
+            onOpenGroup={openGroup}
             onClearHashtag={() => {
               setActiveHashtag(null);
               setHash('/');
@@ -540,6 +547,8 @@ const App: React.FC = () => {
             onAddComment={(groupPostId, text) =>
               showResult(addGroupPostComment(groupPostId, text))
             }
+            onEditComment={(commentId, text) => showResult(editGroupPostComment(commentId, text))}
+            onDeleteComment={(commentId) => showResult(deleteGroupPostComment(commentId))}
             onOpenProfile={openProfile}
             onOpenHashtag={openHashtag}
             onCopyLink={(value) => {
@@ -567,8 +576,11 @@ const App: React.FC = () => {
             onTogglePostRepost={(postId) => showResult(togglePostRepost(postId))}
             onDeletePost={(postId) => showResult(deletePost(postId))}
             onAddPostComment={(postId, text) => showResult(addPostComment(postId, text))}
+            onEditPostComment={(commentId, text) => showResult(editPostComment(commentId, text))}
+            onDeletePostComment={(commentId) => showResult(deletePostComment(commentId))}
             onOpenProfile={openProfile}
             onOpenHashtag={openHashtag}
+            onOpenGroup={openGroup}
             onBack={() => {
               setActiveHashtag(null);
               setCurrentView('feed');
