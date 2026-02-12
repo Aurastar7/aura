@@ -8,12 +8,15 @@
     "dev:web": "vite --host 0.0.0.0 --port 3000",
     "dev:sync": "node server/sync-server.mjs",
     "dev:full": "sh -c 'npm run dev:sync & npm run dev:web'",
+    "start": "node server/sync-server.mjs",
     "start:sync": "node server/sync-server.mjs",
     "build": "vite build",
+    "migrate": "node server/scripts/migrate.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
     "@google/genai": "^1.40.0",
+    "dotenv": "^16.4.7",
     "pg": "^8.18.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",

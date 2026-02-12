@@ -1,31 +1,31 @@
 import { createServer } from 'node:http';
-import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { Pool } from 'pg';
+import { fileURLToPath } from 'node:url';
+import dotenv from 'dotenv';
 import { WebSocketServer } from 'ws';
+import { createPool } from './config/database.mjs';
 
-const port = Number(process.env.SYNC_PORT || 3001);
-const dbUrl = process.env.DATABASE_URL;
-const legacyJsonFile = path.resolve(process.cwd(), 'server', 'data', 'sync-db.json');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const rootDir = path.resolve(__dirname, '..');
 
-if (!dbUrl) {
-  console.error('DATABASE_URL is required. Example: postgresql://user:pass@host:5432/dbname');
-  process.exit(1);
-}
+dotenv.config({ path: path.resolve(rootDir, '.env') });
+dotenv.config({ path: path.resolve(rootDir, '.env.production') });
+dotenv.config();
+
+const port = Number(process.env.SYNC_PORT || process.env.PORT || 3001);
+const corsOrigin = process.env.CORS_ORIGIN || '*';
 
 const headers = {
-  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Origin': corsOrigin,
   'Access-Control-Allow-Methods': 'GET,PUT,OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Headers': 'Content-Type,Authorization',
   'Content-Type': 'application/json; charset=utf-8',
 };
 
 const now = () => new Date().toISOString();
 
-const pool = new Pool({
-  connectionString: dbUrl,
-  ssl: process.env.PGSSL === 'false' ? false : { rejectUnauthorized: false },
-});
+const pool = createPool();
 
 const parseBody = async (req) =>
   new Promise((resolve, reject) => {
@@ -46,7 +46,7 @@ const send = (res, code, payload) => {
   res.end(JSON.stringify(payload));
 };
 
-const ensureSchema = async () => {
+const ensureStateTable = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS aura_state (
       id SMALLINT PRIMARY KEY,
@@ -65,7 +65,7 @@ const ensureSchema = async () => {
   );
 };
 
-const readRow = async () => {
+const readState = async () => {
   const { rows } = await pool.query(
     'SELECT revision, updated_at AS "updatedAt", state FROM aura_state WHERE id = 1 LIMIT 1'
   );
@@ -77,32 +77,6 @@ const readRow = async () => {
   };
 };
 
-const maybeImportLegacyJson = async () => {
-  const current = await readRow();
-  if (current.state) return;
-
-  try {
-    const raw = await fs.readFile(legacyJsonFile, 'utf-8');
-    const parsed = JSON.parse(raw);
-    const state = parsed?.state && typeof parsed.state === 'object' ? parsed.state : parsed;
-    if (!state || typeof state !== 'object') return;
-
-    await pool.query(
-      `
-        UPDATE aura_state
-        SET state = $1::jsonb,
-            revision = GREATEST(revision, 1),
-            updated_at = NOW()
-        WHERE id = 1
-      `,
-      [JSON.stringify(state)]
-    );
-    console.log('Imported legacy JSON state into PostgreSQL.');
-  } catch {
-    // Legacy file is optional.
-  }
-};
-
 const server = createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, headers);
@@ -110,7 +84,7 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.url === '/api/health' && req.method === 'GET') {
+  if ((req.url === '/health' || req.url === '/api/health') && req.method === 'GET') {
     try {
       await pool.query('SELECT 1');
       send(res, 200, { ok: true, service: 'aura-sync', timestamp: now(), db: 'ok' });
@@ -122,7 +96,7 @@ const server = createServer(async (req, res) => {
 
   if (req.url === '/api/db' && req.method === 'GET') {
     try {
-      const envelope = await readRow();
+      const envelope = await readState();
       send(res, 200, envelope);
     } catch (error) {
       send(res, 500, { ok: false, message: String(error) });
@@ -177,6 +151,7 @@ const server = createServer(async (req, res) => {
           `,
           [JSON.stringify(state)]
         );
+
         await client.query('COMMIT');
 
         const next = nextRes.rows[0];
@@ -192,6 +167,9 @@ const server = createServer(async (req, res) => {
           revision: payload.revision,
           updatedAt: payload.updatedAt,
         });
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
       } finally {
         client.release();
       }
@@ -216,7 +194,8 @@ const broadcast = (payload) => {
 };
 
 server.on('upgrade', (req, socket, head) => {
-  const url = new URL(req.url || '/', 'http://localhost');
+  const baseHost = req.headers.host || '127.0.0.1';
+  const url = new URL(req.url || '/', `http://${baseHost}`);
   if (url.pathname !== '/ws') {
     socket.destroy();
     return;
@@ -234,14 +213,14 @@ wss.on('connection', async (ws) => {
   });
 
   try {
-    const row = await readRow();
+    const row = await readState();
     ws.send(JSON.stringify({ type: 'hello', revision: row.revision, updatedAt: row.updatedAt }));
   } catch {
     ws.send(JSON.stringify({ type: 'hello', revision: 0, updatedAt: null }));
   }
 });
 
-const heartbeat = setInterval(() => {
+const heartbeatTimer = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (!ws.isAlive) {
       ws.terminate();
@@ -252,13 +231,47 @@ const heartbeat = setInterval(() => {
   });
 }, 30000);
 
-wss.on('close', () => clearInterval(heartbeat));
+let shuttingDown = false;
+
+const gracefulShutdown = async (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  clearInterval(heartbeatTimer);
+
+  try {
+    wss.clients.forEach((client) => client.close(1001, signal));
+    wss.close();
+  } catch {
+    // ignore
+  }
+
+  await new Promise((resolve) => {
+    server.close(() => resolve());
+  });
+
+  try {
+    await pool.end();
+  } catch {
+    // ignore
+  }
+
+  process.exit(0);
+};
+
+process.on('SIGINT', () => {
+  gracefulShutdown('SIGINT').catch(() => process.exit(1));
+});
+
+process.on('SIGTERM', () => {
+  gracefulShutdown('SIGTERM').catch(() => process.exit(1));
+});
 
 const bootstrap = async () => {
-  await ensureSchema();
-  await maybeImportLegacyJson();
+  await ensureStateTable();
+
   server.listen(port, '0.0.0.0', () => {
-    console.log(`Aura sync server (PostgreSQL + WebSocket) on http://0.0.0.0:${port}`);
+    console.log(`Aura sync server running on 0.0.0.0:${port}`);
   });
 };
 

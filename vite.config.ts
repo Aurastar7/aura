@@ -4,20 +4,30 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig(({ mode }) => {
     const env = loadEnv(mode, '.', '');
+    const apiProxyTarget = env.VITE_DEV_API_PROXY || env.VITE_API_URL;
+    const wsProxyTarget =
+      env.VITE_DEV_WS_PROXY ||
+      (apiProxyTarget
+        ? apiProxyTarget.replace(/^https:\/\//, 'wss://').replace(/^http:\/\//, 'ws://')
+        : undefined);
+
     return {
       server: {
         port: 3000,
         host: '0.0.0.0',
-        proxy: {
-          '/api': {
-            target: 'http://127.0.0.1:3001',
-            changeOrigin: true,
-          },
-          '/ws': {
-            target: 'ws://127.0.0.1:3001',
-            ws: true,
-          },
-        },
+        proxy:
+          apiProxyTarget && wsProxyTarget
+            ? {
+                '/api': {
+                  target: apiProxyTarget,
+                  changeOrigin: true,
+                },
+                '/ws': {
+                  target: wsProxyTarget,
+                  ws: true,
+                },
+              }
+            : undefined,
       },
       plugins: [react()],
       define: {
