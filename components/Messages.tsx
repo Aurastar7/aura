@@ -62,7 +62,33 @@ const Messages: React.FC<MessagesProps> = ({
   }, [onMarkChatRead]);
 
   const candidates = users.filter((candidate) => !candidate.banned);
-  const activeChatUser = candidates.find((candidate) => candidate.id === activeChatUserId) ?? null;
+
+  const lastMessageAtByUser = useMemo(() => {
+    const map = new Map<string, number>();
+    messages.forEach((message) => {
+      const peerId =
+        message.fromId === currentUser.id
+          ? message.toId
+          : message.toId === currentUser.id
+            ? message.fromId
+            : null;
+      if (!peerId) return;
+      const stamp = new Date(message.createdAt).getTime();
+      const current = map.get(peerId) ?? 0;
+      if (stamp > current) map.set(peerId, stamp);
+    });
+    return map;
+  }, [messages, currentUser.id]);
+
+  const sortedCandidates = useMemo(
+    () =>
+      [...candidates].sort(
+        (a, b) => (lastMessageAtByUser.get(b.id) ?? 0) - (lastMessageAtByUser.get(a.id) ?? 0)
+      ),
+    [candidates, lastMessageAtByUser]
+  );
+
+  const activeChatUser = sortedCandidates.find((candidate) => candidate.id === activeChatUserId) ?? null;
 
   const unreadByUser = useMemo(() => {
     const map = new Map<string, number>();
@@ -89,7 +115,7 @@ const Messages: React.FC<MessagesProps> = ({
           (message.fromId === currentUser.id && message.toId === activeChatUser.id) ||
           (message.fromId === activeChatUser.id && message.toId === currentUser.id)
       )
-      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }, [messages, currentUser.id, activeChatUser]);
 
   useEffect(() => {
@@ -97,7 +123,7 @@ const Messages: React.FC<MessagesProps> = ({
     const container = conversationRef.current;
     if (!container) return;
     requestAnimationFrame(() => {
-      container.scrollTop = container.scrollHeight;
+      container.scrollTop = 0;
     });
   }, [activeChatUserId, conversation.length]);
 
@@ -134,13 +160,13 @@ const Messages: React.FC<MessagesProps> = ({
   };
 
   const chatList = (
-    <div className="rounded-2xl border-2 border-slate-200 dark:border-slate-800 overflow-hidden h-full min-h-0 flex flex-col">
-      <div className="px-4 py-3 border-b-2 border-slate-200 dark:border-slate-800">
+    <div className="rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden h-full min-h-0 flex flex-col">
+      <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800">
         <h2 className="text-sm font-semibold text-slate-500">Choose user</h2>
       </div>
       <div className="divide-y divide-slate-200 dark:divide-slate-800 flex-1 min-h-0 overflow-y-auto">
-        {candidates.length > 0 ? (
-          candidates.map((candidate) => {
+        {sortedCandidates.length > 0 ? (
+          sortedCandidates.map((candidate) => {
             const unread = unreadByUser.get(candidate.id) ?? 0;
             return (
               <button
@@ -184,8 +210,8 @@ const Messages: React.FC<MessagesProps> = ({
   );
 
   const chatWindow = activeChatUser ? (
-    <section className="rounded-2xl border-2 border-slate-200 dark:border-slate-800 overflow-hidden h-full min-h-0 flex flex-col">
-      <div className="px-4 py-3 border-b-2 border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3">
+    <section className="rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden h-full min-h-0 flex flex-col">
+      <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
           <button
             onClick={() => {
@@ -339,7 +365,7 @@ const Messages: React.FC<MessagesProps> = ({
         )}
       </div>
 
-      <form onSubmit={submit} className="shrink-0 px-4 py-3 border-t-2 border-slate-200 dark:border-slate-800 space-y-2">
+      <form onSubmit={submit} className="shrink-0 px-4 py-3 border-t border-slate-200 dark:border-slate-800 space-y-2">
         {(draftMediaType && draftMediaUrl) ? (
           <div className="rounded-xl border-2 border-slate-300 dark:border-slate-700 p-2 text-xs">
             <div className="flex items-center justify-between gap-2 mb-2">
@@ -386,7 +412,7 @@ const Messages: React.FC<MessagesProps> = ({
       </form>
     </section>
   ) : (
-    <div className="rounded-2xl border-2 border-slate-200 dark:border-slate-800 h-full min-h-0 flex items-center justify-center text-sm text-slate-500 p-8 text-center">
+    <div className="rounded-2xl border border-slate-200 dark:border-slate-800 h-full min-h-0 flex items-center justify-center text-sm text-slate-500 p-8 text-center">
       Select user to start a conversation.
     </div>
   );

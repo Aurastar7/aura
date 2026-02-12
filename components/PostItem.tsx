@@ -167,7 +167,7 @@ const PostItem: React.FC<PostItemProps> = ({
         key={comment.id}
         id={`post-comment-${comment.id}`}
         className={`w-full max-w-full overflow-hidden rounded-xl border-2 border-slate-200 dark:border-slate-800 px-3 py-2 hover:bg-slate-50 dark:hover:bg-slate-900 scroll-mt-24 ${
-          depth > 0 ? 'ml-4 sm:ml-8 border-l-4 pl-3 sm:pl-4' : ''
+          depth > 0 ? 'ml-2 sm:ml-4 border-l-4 pl-3 sm:pl-4' : ''
         }`}
       >
         <div className="flex items-start gap-2">

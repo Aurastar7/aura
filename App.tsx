@@ -69,7 +69,6 @@ const App: React.FC = () => {
     createGroupPost,
     toggleGroupPostLike,
     repostGroupPostToProfile,
-    publishGroupPostToFeed,
     editGroupPost,
     deleteGroupPost,
     addGroupPostComment,
@@ -541,7 +540,6 @@ const App: React.FC = () => {
             }
             onTogglePostLike={(groupPostId) => showResult(toggleGroupPostLike(groupPostId))}
             onRepostToProfile={(groupPostId) => showResult(repostGroupPostToProfile(groupPostId))}
-            onPublishToFeed={(groupPostId) => showResult(publishGroupPostToFeed(groupPostId))}
             onEditPost={(groupPostId, text) => showResult(editGroupPost(groupPostId, text))}
             onDeletePost={(groupPostId) => showResult(deleteGroupPost(groupPostId))}
             onAddComment={(groupPostId, text) =>

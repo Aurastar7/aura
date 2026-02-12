@@ -1377,16 +1377,22 @@ export function useStore(): UseStore {
     const root = db.groupPosts.find((post) => post.id === rootId);
     if (!root) return fail('Original post not found.');
 
-    const existingRepost = db.posts.find(
+    const existingReposts = db.posts.filter(
       (post) => post.authorId === user.id && post.repostOfGroupPostId === rootId
     );
+    const hasExistingRepost = existingReposts.length > 0;
 
     setDb((prev) => {
-      if (existingRepost) {
+      if (hasExistingRepost) {
+        const deleteIds = new Set(
+          prev.posts
+            .filter((post) => post.authorId === user.id && post.repostOfGroupPostId === rootId)
+            .map((post) => post.id)
+        );
         return {
           ...prev,
-          posts: prev.posts.filter((post) => post.id !== existingRepost.id),
-          postComments: prev.postComments.filter((comment) => comment.postId !== existingRepost.id),
+          posts: prev.posts.filter((post) => !deleteIds.has(post.id)),
+          postComments: prev.postComments.filter((comment) => !deleteIds.has(comment.postId)),
           groupPosts: prev.groupPosts.map((post) =>
             post.id === rootId
               ? { ...post, repostedBy: post.repostedBy.filter((id) => id !== user.id) }
@@ -1410,7 +1416,12 @@ export function useStore(): UseStore {
 
       return {
         ...prev,
-        posts: [repost, ...prev.posts],
+        posts: [
+          repost,
+          ...prev.posts.filter(
+            (post) => !(post.authorId === user.id && post.repostOfGroupPostId === rootId)
+          ),
+        ],
         groupPosts: prev.groupPosts.map((post) =>
           post.id === rootId && !post.repostedBy.includes(user.id)
             ? { ...post, repostedBy: [...post.repostedBy, user.id] }
@@ -1419,35 +1430,12 @@ export function useStore(): UseStore {
       };
     });
 
-    return ok(existingRepost ? 'Repost removed from your profile.' : 'Reposted to your profile.');
+    return ok(hasExistingRepost ? 'Repost removed from your profile.' : 'Reposted to your profile.');
   };
 
   const publishGroupPostToFeed = (groupPostId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const source = db.groupPosts.find((post) => post.id === groupPostId);
-    if (!source) return fail('Group post not found.');
-    const group = db.groups.find((candidate) => candidate.id === source.groupId);
-    if (!group) return fail('Group not found.');
-    if (!canManageGroup(group)) return fail('Only group admin can publish this post to main wall.');
-
-    const post: Post = {
-      id: makeId('post'),
-      authorId: source.authorId,
-      text: source.text,
-      mediaType: source.mediaType,
-      mediaUrl: source.mediaUrl,
-      createdAt: new Date().toISOString(),
-      likedBy: [],
-      repostedBy: [],
-      repostOfGroupPostId: source.id,
-      repostSourceGroupId: group.id,
-    };
-
-    setDb((prev) => ({
-      ...prev,
-      posts: [post, ...prev.posts],
-    }));
-    return ok('Group post published to main wall.');
+    void groupPostId;
+    return fail('Publishing group posts to main wall is disabled. Use repost to profile.');
   };
 
   const editGroupPost = (groupPostId: string, text: string): ActionResult => {

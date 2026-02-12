@@ -28,7 +28,6 @@ interface GroupsProps {
   onCreatePost: (groupId: string, text: string, mediaType?: MediaType, mediaUrl?: string) => void;
   onTogglePostLike: (groupPostId: string) => void;
   onRepostToProfile: (groupPostId: string) => void;
-  onPublishToFeed: (groupPostId: string) => void;
   onEditPost: (groupPostId: string, text: string) => void;
   onDeletePost: (groupPostId: string) => void;
   onAddComment: (groupPostId: string, text: string) => void;
@@ -62,7 +61,6 @@ const Groups: React.FC<GroupsProps> = ({
   onCreatePost,
   onTogglePostLike,
   onRepostToProfile,
-  onPublishToFeed,
   onEditPost,
   onDeletePost,
   onAddComment,
@@ -92,6 +90,7 @@ const Groups: React.FC<GroupsProps> = ({
   const [showAllMembers, setShowAllMembers] = useState(false);
   const [visiblePostsCount, setVisiblePostsCount] = useState(10);
   const [visibleCommentsByPost, setVisibleCommentsByPost] = useState<Record<string, number>>({});
+  const [expandedCommentsByPost, setExpandedCommentsByPost] = useState<Record<string, boolean>>({});
   const [groupEdit, setGroupEdit] = useState<GroupPatch | null>(null);
 
   const membersByGroup = useMemo(() => {
@@ -161,6 +160,7 @@ const Groups: React.FC<GroupsProps> = ({
   useEffect(() => {
     setVisiblePostsCount(10);
     setVisibleCommentsByPost({});
+    setExpandedCommentsByPost({});
     setCollapsedReplies({});
     setActiveCommentMenuId(null);
     setEditingCommentId(null);
@@ -681,7 +681,7 @@ const Groups: React.FC<GroupsProps> = ({
                     key={comment.id}
                     id={`group-comment-${comment.id}`}
                     className={`w-full max-w-full overflow-hidden rounded-xl bg-slate-50 dark:bg-slate-900 border-2 border-slate-200 dark:border-slate-800 px-3 py-2 scroll-mt-24 ${
-                      depth > 0 ? 'ml-4 sm:ml-8 border-l-4 pl-3 sm:pl-4' : ''
+                      depth > 0 ? 'ml-2 sm:ml-4 border-l-4 pl-3 sm:pl-4' : ''
                     }`}
                   >
                     <div className="flex items-start gap-2">
@@ -920,14 +920,6 @@ const Groups: React.FC<GroupsProps> = ({
                     >
                       Repost {rootPost.repostedBy.length}
                     </button>
-                    {isGroupAdmin ? (
-                      <button
-                        onClick={() => onPublishToFeed(post.id)}
-                        className="rounded-xl px-3 py-1.5 text-xs font-semibold border border-slate-300 dark:border-slate-700"
-                      >
-                        Publish to feed
-                      </button>
-                    ) : null}
                   </div>
 
                   <form
@@ -956,25 +948,48 @@ const Groups: React.FC<GroupsProps> = ({
                     </button>
                   </form>
 
-                  {topLevel.length > 0 ? (
-                    <div className="mt-3 space-y-1.5">
-                      {visibleTopLevel.map((comment) => renderComment(comment))}
-                      {topLevel.length > (visibleCommentsByPost[post.id] ?? 5) ? (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setVisibleCommentsByPost((prev) => ({
-                              ...prev,
-                              [post.id]: (prev[post.id] ?? 5) + 5,
-                            }))
-                          }
-                          className="rounded-lg border-2 border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs font-semibold"
-                        >
-                          Show 5 more comments
-                        </button>
-                      ) : null}
-                    </div>
-                  ) : null}
+                  <div className="mt-3">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setExpandedCommentsByPost((prev) => ({
+                          ...prev,
+                          [post.id]: !prev[post.id],
+                        }))
+                      }
+                      className="rounded-lg border-2 border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs font-semibold"
+                    >
+                      {expandedCommentsByPost[post.id]
+                        ? `Hide comments (${topLevel.length})`
+                        : `Show comments (${topLevel.length})`}
+                    </button>
+
+                    {expandedCommentsByPost[post.id] ? (
+                      <div className="mt-2 max-h-80 overflow-y-auto pr-1 rounded-xl border border-slate-200 dark:border-slate-800 p-2 space-y-1.5">
+                        {topLevel.length > 0 ? (
+                          <>
+                            {visibleTopLevel.map((comment) => renderComment(comment))}
+                            {topLevel.length > (visibleCommentsByPost[post.id] ?? 5) ? (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setVisibleCommentsByPost((prev) => ({
+                                    ...prev,
+                                    [post.id]: (prev[post.id] ?? 5) + 5,
+                                  }))
+                                }
+                                className="rounded-lg border-2 border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs font-semibold"
+                              >
+                                Show 5 more comments
+                              </button>
+                            ) : null}
+                          </>
+                        ) : (
+                          <p className="text-xs text-slate-500 px-1 py-1">No comments yet.</p>
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
                 </article>
               );
             })
