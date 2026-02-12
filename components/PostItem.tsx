@@ -43,7 +43,7 @@ const PostItem: React.FC<PostItemProps> = ({
 }) => {
   const [commentText, setCommentText] = useState('');
   const [showComments, setShowComments] = useState(false);
-  const [visibleCommentsCount, setVisibleCommentsCount] = useState(5);
+  const [visibleCommentsCount, setVisibleCommentsCount] = useState(3);
   const [activeCommentMenuId, setActiveCommentMenuId] = useState<string | null>(null);
   const [editingCommentId, setEditingCommentId] = useState<string | null>(null);
   const [editingCommentText, setEditingCommentText] = useState('');
@@ -360,7 +360,7 @@ const PostItem: React.FC<PostItemProps> = ({
             <button
               onClick={() => {
                 setShowComments((prev) => !prev);
-                setVisibleCommentsCount(5);
+                setVisibleCommentsCount(3);
               }}
               className="flex items-center gap-2 group/btn text-slate-500 hover:text-slate-900 dark:hover:text-white transition-colors"
             >
@@ -422,20 +422,22 @@ const PostItem: React.FC<PostItemProps> = ({
 
           {showComments ? (
             <div className="space-y-2">
-              {topLevelComments.length ? (
-                topLevelComments
-                  .slice(0, visibleCommentsCount)
-                  .map((comment) => renderComment(comment))
-              ) : (
-                <p className="text-sm text-slate-500">No comments yet.</p>
-              )}
-              {topLevelComments.length > visibleCommentsCount ? (
+              <div className="max-h-80 overflow-y-auto pr-1 space-y-2">
+                {topLevelComments.length ? (
+                  topLevelComments
+                    .slice(0, Math.min(visibleCommentsCount, 10))
+                    .map((comment) => renderComment(comment))
+                ) : (
+                  <p className="text-sm text-slate-500">No comments yet.</p>
+                )}
+              </div>
+              {Math.min(topLevelComments.length, 10) > visibleCommentsCount ? (
                 <button
                   type="button"
-                  onClick={() => setVisibleCommentsCount((prev) => prev + 5)}
+                  onClick={() => setVisibleCommentsCount((prev) => Math.min(prev + 3, 10))}
                   className="rounded-lg border-2 border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs font-semibold"
                 >
-                  Show 5 more comments
+                  Show more comments
                 </button>
               ) : null}
             </div>

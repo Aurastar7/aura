@@ -120,6 +120,11 @@ const Messages: React.FC<MessagesProps> = ({
 
   useEffect(() => {
     if (!activeChatUserId) return;
+    onMarkChatReadRef.current(activeChatUserId);
+  }, [activeChatUserId, conversation.length]);
+
+  useEffect(() => {
+    if (!activeChatUserId) return;
     const container = conversationRef.current;
     if (!container) return;
     requestAnimationFrame(() => {
@@ -392,7 +397,7 @@ const Messages: React.FC<MessagesProps> = ({
             value={text}
             onChange={(event) => setText(event.target.value)}
             placeholder="Write a message"
-            className="flex-1 rounded-xl border-2 border-slate-300 dark:border-slate-700 bg-white dark:bg-black px-3 py-2 text-sm"
+            className="flex-1 rounded-xl border-2 border-slate-300 dark:border-slate-700 bg-white dark:bg-black px-3 py-2 text-base lg:text-sm"
           />
           <button
             type="submit"

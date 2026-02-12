@@ -663,7 +663,10 @@ const Groups: React.FC<GroupsProps> = ({
               const reposted = rootPost.repostedBy.includes(currentUser.id);
               const canManagePost = isGroupAdmin || post.authorId === currentUser.id;
               const isEditingPost = editingPostId === post.id;
-              const visibleTopLevel = topLevel.slice(0, visibleCommentsByPost[post.id] ?? 5);
+              const visibleTopLevel = topLevel.slice(
+                0,
+                Math.min(visibleCommentsByPost[post.id] ?? 3, 10)
+              );
 
               const renderComment = (comment: GroupPostComment, depth = 0): React.ReactNode => {
                 const commentUser = usersById[comment.authorId];
@@ -969,18 +972,18 @@ const Groups: React.FC<GroupsProps> = ({
                         {topLevel.length > 0 ? (
                           <>
                             {visibleTopLevel.map((comment) => renderComment(comment))}
-                            {topLevel.length > (visibleCommentsByPost[post.id] ?? 5) ? (
+                            {Math.min(topLevel.length, 10) > (visibleCommentsByPost[post.id] ?? 3) ? (
                               <button
                                 type="button"
                                 onClick={() =>
                                   setVisibleCommentsByPost((prev) => ({
                                     ...prev,
-                                    [post.id]: (prev[post.id] ?? 5) + 5,
+                                    [post.id]: Math.min((prev[post.id] ?? 3) + 3, 10),
                                   }))
                                 }
                                 className="rounded-lg border-2 border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs font-semibold"
                               >
-                                Show 5 more comments
+                                Show more comments
                               </button>
                             ) : null}
                           </>
