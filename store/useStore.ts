@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActionResult,
   AppView,
@@ -25,17 +25,35 @@ import {
   User,
   UserRole,
 } from '../types';
-import {
-  cleanDbState,
-  connectSyncSocket,
-  loadDb,
-  loadRemoteDb,
-  makeId,
-  persistDb,
-  persistRemoteDb,
-  resetDb,
-  syncFingerprint,
-} from '../services/db';
+import { apiUrl } from '../services/api';
+
+const TOKEN_KEY = 'aura-token';
+const THEME_KEY = 'aura-theme';
+const PENDING_VERIFY_USER_KEY = 'aura-pending-verify-user';
+
+const nowIso = () => new Date().toISOString();
+
+const cleanDbState = (theme: ThemeMode = 'dark'): SocialDb => ({
+  users: [],
+  follows: [],
+  posts: [],
+  postComments: [],
+  stories: [],
+  storyComments: [],
+  messages: [],
+  groups: [],
+  groupMembers: [],
+  groupPosts: [],
+  groupPostComments: [],
+  notifications: [],
+  theme,
+  session: {
+    userId: null,
+    currentView: 'feed',
+    activeChatUserId: null,
+    activeGroupId: null,
+  },
+});
 
 type UseStore = {
   db: SocialDb;
@@ -58,6 +76,7 @@ type UseStore = {
   activeChatUserId: string | null;
   activeGroupId: string | null;
   register: (payload: RegisterPayload) => ActionResult;
+  verifyPending: (code: string) => ActionResult;
   login: (payload: LoginPayload) => ActionResult;
   logout: () => void;
   setTheme: (theme: ThemeMode) => void;
@@ -115,514 +134,466 @@ type UseStore = {
 
 const ok = (message: string): ActionResult => ({ ok: true, message });
 const fail = (message: string): ActionResult => ({ ok: false, message });
-const isAdmin = (user: User | null) => user?.role === 'admin';
 
-const sortByDateDesc = <T extends { createdAt: string }>(list: T[]) =>
-  [...list].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+const toUser = (raw: any): User => {
+  const createdAt = raw?.createdAt || raw?.created_at || nowIso();
+  const updatedAt = raw?.updatedAt || raw?.updated_at || createdAt;
+  const displayName = raw?.displayName || raw?.display_name || raw?.username || 'User';
+  const avatar = raw?.avatarUrl || raw?.avatar_url || '';
 
-const withLocalSession = (remote: SocialDb, prev: SocialDb): SocialDb => ({
-  ...remote,
-  theme: prev.theme,
-  session: {
-    ...remote.session,
-    userId: prev.session.userId,
-    currentView: prev.session.currentView,
-    activeChatUserId: prev.session.activeChatUserId,
-    activeGroupId: prev.session.activeGroupId ?? remote.session.activeGroupId,
-  },
+  return {
+    id: String(raw?.id || ''),
+    username: String(raw?.username || ''),
+    password: '',
+    displayName: String(displayName),
+    bio: String(raw?.bio || ''),
+    status: String(raw?.status || ''),
+    avatar,
+    coverImage: String(raw?.coverImage || ''),
+    role: raw?.role === 'admin' ? 'admin' : 'user',
+    banned: Boolean(raw?.banned),
+    restricted: Boolean(raw?.restricted),
+    verified: Boolean(raw?.isVerified || raw?.verified),
+    hiddenFromFriends: Boolean(raw?.hiddenFromFriends),
+    createdAt,
+    updatedAt,
+    lastSeenAt: String(raw?.lastSeenAt || nowIso()),
+  };
+};
+
+const toPost = (raw: any): Post => ({
+  id: String(raw?.id || ''),
+  authorId: String(raw?.userId || raw?.author?.id || ''),
+  text: String(raw?.content || raw?.text || ''),
+  mediaType: undefined,
+  mediaUrl: undefined,
+  createdAt: String(raw?.createdAt || nowIso()),
+  likedBy: Array.isArray(raw?.likedBy) ? raw.likedBy : [],
+  repostedBy: Array.isArray(raw?.repostedBy) ? raw.repostedBy : [],
+  repostOfPostId: raw?.repostOfPostId,
+  repostOfGroupPostId: raw?.repostOfGroupPostId,
+  repostSourceGroupId: raw?.repostSourceGroupId,
 });
 
-const newerIso = (left?: string, right?: string) =>
-  new Date(left || 0).getTime() >= new Date(right || 0).getTime();
-
-const mergeById = <T extends { id: string }>(
-  local: T[],
-  remote: T[],
-  choose: (localItem: T, remoteItem: T) => T
-) => {
-  const map = new Map<string, T>();
-  remote.forEach((item) => map.set(item.id, item));
-  local.forEach((item) => {
-    const existing = map.get(item.id);
-    map.set(item.id, existing ? choose(item, existing) : item);
-  });
-  return [...map.values()];
+const toMessage = (raw: any, me: string): Message => {
+  const senderId = String(raw?.senderId || raw?.fromId || '');
+  const receiverId = String(raw?.receiverId || raw?.toId || '');
+  const createdAt = String(raw?.createdAt || nowIso());
+  return {
+    id: String(raw?.id || ''),
+    fromId: senderId,
+    toId: receiverId,
+    text: String(raw?.content || raw?.text || ''),
+    mediaType: raw?.mediaType,
+    mediaUrl: raw?.mediaUrl,
+    expiresAt: raw?.expiresAt,
+    editedAt: raw?.editedAt,
+    readBy: receiverId === me ? [] : [me],
+    createdAt,
+  };
 };
 
-const mergeUsers = (local: User[], remote: User[]): User[] => {
-  const map = new Map<string, User>();
-  remote.forEach((item) => map.set(item.id, item));
-  local.forEach((localUser) => {
-    const remoteUser = map.get(localUser.id);
-    if (!remoteUser) {
-      map.set(localUser.id, localUser);
-      return;
-    }
-
-    const preferLocal = newerIso(localUser.updatedAt, remoteUser.updatedAt);
-    const base = preferLocal ? localUser : remoteUser;
-    const other = preferLocal ? remoteUser : localUser;
-    map.set(localUser.id, {
-      ...base,
-      // Keep presence as newest heartbeat signal, but role/profile from newest updatedAt.
-      lastSeenAt: newerIso(localUser.lastSeenAt, remoteUser.lastSeenAt)
-        ? localUser.lastSeenAt
-        : remoteUser.lastSeenAt,
-      updatedAt: newerIso(base.updatedAt, other.updatedAt) ? base.updatedAt : other.updatedAt,
-    });
-  });
-  return [...map.values()];
-};
-
-const mergeGroups = (local: Group[], remote: Group[]): Group[] => {
-  const map = new Map<string, Group>();
-  remote.forEach((item) => map.set(item.id, item));
-  local.forEach((localGroup) => {
-    const remoteGroup = map.get(localGroup.id);
-    if (!remoteGroup) {
-      map.set(localGroup.id, localGroup);
-      return;
-    }
-
-    const localUpdatedAt = localGroup.updatedAt || localGroup.createdAt;
-    const remoteUpdatedAt = remoteGroup.updatedAt || remoteGroup.createdAt;
-    map.set(localGroup.id, newerIso(localUpdatedAt, remoteUpdatedAt) ? localGroup : remoteGroup);
-  });
-  return [...map.values()];
-};
-
-const mergeDb = (local: SocialDb, remote: SocialDb): SocialDb => ({
-  ...remote,
-  users: mergeUsers(local.users, remote.users),
-  follows: mergeById(local.follows, remote.follows, (l, r) => (newerIso(l.createdAt, r.createdAt) ? l : r)),
-  posts: mergeById(local.posts, remote.posts, (l, r) => (newerIso(l.createdAt, r.createdAt) ? l : r)),
-  postComments: mergeById(local.postComments, remote.postComments, (l, r) =>
-    newerIso(l.createdAt, r.createdAt) ? l : r
-  ),
-  stories: mergeById(local.stories, remote.stories, (l, r) => (newerIso(l.createdAt, r.createdAt) ? l : r)),
-  storyComments: mergeById(local.storyComments, remote.storyComments, (l, r) =>
-    newerIso(l.createdAt, r.createdAt) ? l : r
-  ),
-  messages: mergeById(local.messages, remote.messages, (l, r) => (newerIso(l.createdAt, r.createdAt) ? l : r)),
-  groups: mergeGroups(local.groups, remote.groups),
-  groupMembers: mergeById(local.groupMembers, remote.groupMembers, (l, r) =>
-    newerIso(l.createdAt, r.createdAt) ? l : r
-  ),
-  groupPosts: mergeById(local.groupPosts, remote.groupPosts, (l, r) =>
-    newerIso(l.createdAt, r.createdAt) ? l : r
-  ),
-  groupPostComments: mergeById(local.groupPostComments, remote.groupPostComments, (l, r) =>
-    newerIso(l.createdAt, r.createdAt) ? l : r
-  ),
-  notifications: mergeById(local.notifications, remote.notifications, (l, r) =>
-    newerIso(l.createdAt, r.createdAt) ? l : r
-  ),
-  theme: local.theme,
-  session: local.session,
-});
+const isWsOpen = (ws: WebSocket | null) => ws?.readyState === WebSocket.OPEN;
 
 export function useStore(): UseStore {
-  const [db, setDb] = useState<SocialDb>(() => loadDb());
-  const [remoteEnabled, setRemoteEnabled] = useState(true);
-  const [remoteSynced, setRemoteSynced] = useState(false);
-  const syncHashRef = useRef<string>('');
-  const startupHashRef = useRef<string>('');
-  const remoteRevisionRef = useRef(0);
-  const remoteFailCountRef = useRef(0);
-  const pushingRef = useRef(false);
-  const bootstrappingRef = useRef(false);
-  const pullingRef = useRef(false);
-  const bootstrapAbortRef = useRef<AbortController | null>(null);
-  const pushAbortRef = useRef<AbortController | null>(null);
-  const pullAbortRef = useRef<AbortController | null>(null);
-  const lastPresenceUpdateRef = useRef(0);
-  const dbRef = useRef(db);
+  const initialTheme = (typeof window !== 'undefined' && localStorage.getItem(THEME_KEY) === 'light')
+    ? 'light'
+    : 'dark';
 
-  if (!startupHashRef.current) {
-    startupHashRef.current = syncFingerprint(db);
-  }
+  const [db, setDb] = useState<SocialDb>(() => cleanDbState(initialTheme));
+  const [token, setToken] = useState<string>(() => {
+    if (typeof window === 'undefined') return '';
+    return localStorage.getItem(TOKEN_KEY) || '';
+  });
+  const [pendingVerificationUserId, setPendingVerificationUserId] = useState<string>(() => {
+    if (typeof window === 'undefined') return '';
+    return localStorage.getItem(PENDING_VERIFY_USER_KEY) || '';
+  });
 
-  useEffect(() => {
-    dbRef.current = db;
-  }, [db]);
+  const wsRef = useRef<WebSocket | null>(null);
+  const wsTimerRef = useRef<number | null>(null);
 
   const user = useMemo(
     () => db.users.find((candidate) => candidate.id === db.session.userId) ?? null,
     [db.users, db.session.userId]
   );
 
-  const posts = useMemo(() => sortByDateDesc(db.posts), [db.posts]);
-  const postComments = useMemo(() => sortByDateDesc(db.postComments), [db.postComments]);
-  const stories = useMemo(
-    () =>
-      sortByDateDesc(
-        db.stories.filter((story) => new Date(story.expiresAt).getTime() > Date.now())
-      ),
-    [db.stories]
-  );
-  const storyComments = useMemo(() => sortByDateDesc(db.storyComments), [db.storyComments]);
-  const messages = useMemo(() => sortByDateDesc(db.messages), [db.messages]);
-  const groups = useMemo(() => sortByDateDesc(db.groups), [db.groups]);
-  const groupMembers = useMemo(() => sortByDateDesc(db.groupMembers), [db.groupMembers]);
-  const groupPosts = useMemo(() => sortByDateDesc(db.groupPosts), [db.groupPosts]);
-  const groupPostComments = useMemo(
-    () => sortByDateDesc(db.groupPostComments),
-    [db.groupPostComments]
-  );
-
-  const notifications = useMemo(() => {
-    if (!user) return [];
-    const allowed = new Set(['follow', 'post_like', 'post_repost', 'group_post_like', 'comment_mention']);
-    return sortByDateDesc(
-      db.notifications.filter((item) => item.userId === user.id && allowed.has(item.type))
-    );
-  }, [db.notifications, user]);
-
-  const unreadMessagesCount = useMemo(() => {
-    if (!user) return 0;
-    return db.messages.filter(
-      (message) => message.toId === user.id && !message.readBy.includes(user.id)
-    ).length;
-  }, [db.messages, user]);
-
   const users = useMemo(
     () => db.users.filter((candidate) => candidate.id !== user?.id),
     [db.users, user?.id]
   );
 
-  useEffect(() => {
-    if (remoteSynced || !remoteEnabled) return;
-    let cancelled = false;
-    const bootstrap = async () => {
-      if (bootstrappingRef.current) return;
-      bootstrappingRef.current = true;
-      bootstrapAbortRef.current?.abort();
-      const controller = new AbortController();
-      bootstrapAbortRef.current = controller;
-      const remote = await loadRemoteDb(controller.signal);
-      bootstrappingRef.current = false;
-      if (cancelled) return;
-      if (!remote.ok) {
-        remoteFailCountRef.current += 1;
-        if (remoteFailCountRef.current >= 3) {
-          setRemoteEnabled(false);
-          setRemoteSynced(true);
-        }
-        return;
+  const posts = useMemo(
+    () => [...db.posts].sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt)),
+    [db.posts]
+  );
+
+  const postComments = useMemo(
+    () => [...db.postComments].sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt)),
+    [db.postComments]
+  );
+
+  const stories = useMemo(
+    () => [...db.stories].sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt)),
+    [db.stories]
+  );
+
+  const storyComments = useMemo(
+    () => [...db.storyComments].sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt)),
+    [db.storyComments]
+  );
+
+  const messages = useMemo(
+    () => [...db.messages].sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt)),
+    [db.messages]
+  );
+
+  const groups = useMemo(() => db.groups, [db.groups]);
+  const groupMembers = useMemo(() => db.groupMembers, [db.groupMembers]);
+  const groupPosts = useMemo(() => db.groupPosts, [db.groupPosts]);
+  const groupPostComments = useMemo(() => db.groupPostComments, [db.groupPostComments]);
+  const notifications = useMemo(() => db.notifications, [db.notifications]);
+
+  const unreadMessagesCount = useMemo(() => {
+    if (!user) return 0;
+    return db.messages.filter((message) => message.toId === user.id && !message.readBy.includes(user.id)).length;
+  }, [db.messages, user]);
+
+  const isAuthenticated = Boolean(token && db.session.userId);
+  const darkMode = db.theme === 'dark';
+  const currentView = db.session.currentView;
+  const activeChatUserId = db.session.activeChatUserId;
+  const activeGroupId = db.session.activeGroupId;
+
+  const apiRequest = useCallback(
+    async (path: string, options: RequestInit = {}, requiresAuth = false) => {
+      const headers = new Headers(options.headers || {});
+      if (!headers.has('Content-Type') && options.body) headers.set('Content-Type', 'application/json');
+      if (requiresAuth && token) headers.set('Authorization', `Bearer ${token}`);
+
+      const response = await fetch(apiUrl(path), {
+        ...options,
+        headers,
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(String(data?.message || `Request failed (${response.status})`));
       }
-      remoteFailCountRef.current = 0;
-      remoteRevisionRef.current = remote.revision;
-      if (remote.state) {
-        const localNow = dbRef.current;
-        const localHash = syncFingerprint(localNow);
-        const remoteHash = syncFingerprint(remote.state);
-        if (localHash === remoteHash) {
-          syncHashRef.current = remoteHash;
-          setRemoteSynced(true);
-          return;
-        }
-        if (localHash !== startupHashRef.current && localHash !== remoteHash) {
-          const merged = mergeDb(localNow, remote.state as SocialDb);
-          setDb((prev) => withLocalSession(merged, prev));
-          pushAbortRef.current?.abort();
-          const pushController = new AbortController();
-          pushAbortRef.current = pushController;
-          const pushed = await persistRemoteDb(merged, remote.revision, pushController.signal);
-          if (pushed.ok) {
-            remoteRevisionRef.current = pushed.revision;
-            syncHashRef.current = syncFingerprint(merged);
-          } else if (pushed.conflict && pushed.state) {
-            remoteRevisionRef.current = pushed.revision;
-            const mergedAfterConflict = mergeDb(merged, pushed.state as SocialDb);
-            syncHashRef.current = syncFingerprint(mergedAfterConflict);
-            setDb((prev) => withLocalSession(mergedAfterConflict, prev));
-          }
-        } else {
-          syncHashRef.current = remoteHash;
-          setDb((prev) => withLocalSession(remote.state as SocialDb, prev));
-        }
-      } else {
-        pushAbortRef.current?.abort();
-        const pushController = new AbortController();
-        pushAbortRef.current = pushController;
-        const pushed = await persistRemoteDb(dbRef.current, remote.revision, pushController.signal);
-        if (pushed.ok) {
-          remoteRevisionRef.current = pushed.revision;
-          syncHashRef.current = syncFingerprint(dbRef.current);
-        }
-      }
-      setRemoteSynced(true);
-    };
 
-    void bootstrap();
-    const timer = window.setInterval(() => {
-      if (remoteSynced || !remoteEnabled) return;
-      void bootstrap();
-    }, 5000);
+      return data;
+    },
+    [token]
+  );
 
-    return () => {
-      cancelled = true;
-      bootstrapAbortRef.current?.abort();
-      pushAbortRef.current?.abort();
-      window.clearInterval(timer);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [remoteEnabled, remoteSynced]);
-
-  useEffect(() => {
-    persistDb(db);
-    if (!remoteSynced || !remoteEnabled) return;
-
-    const nextHash = syncFingerprint(db);
-    if (nextHash === syncHashRef.current) return;
-
-    const timer = window.setTimeout(async () => {
-      pushingRef.current = true;
-      pushAbortRef.current?.abort();
-      const controller = new AbortController();
-      pushAbortRef.current = controller;
-      const pushed = await persistRemoteDb(db, remoteRevisionRef.current, controller.signal);
-      pushingRef.current = false;
-      if (pushed.ok) {
-        remoteRevisionRef.current = pushed.revision;
-        syncHashRef.current = nextHash;
-        return;
-      }
-      if (pushed.conflict && pushed.state) {
-        remoteRevisionRef.current = pushed.revision;
-        const merged = mergeDb(dbRef.current, pushed.state as SocialDb);
-        syncHashRef.current = syncFingerprint(merged);
-        setDb((prev) => withLocalSession(merged, prev));
-      }
-    }, 120);
-
-    return () => {
-      window.clearTimeout(timer);
-      pushAbortRef.current?.abort();
-    };
-  }, [db, remoteEnabled, remoteSynced]);
-
-  useEffect(() => {
-    if (!remoteSynced || !remoteEnabled) return;
-
-    const pullRemote = async () => {
-      if (pushingRef.current) return;
-      if (pullingRef.current) return;
-      pullingRef.current = true;
-      pullAbortRef.current?.abort();
-      const controller = new AbortController();
-      pullAbortRef.current = controller;
-      const remote = await loadRemoteDb(controller.signal);
-      pullingRef.current = false;
-      if (!remote.ok || !remote.state) return;
-      remoteRevisionRef.current = remote.revision;
-      const remoteHash = syncFingerprint(remote.state);
-      if (remoteHash === syncHashRef.current) return;
-      const merged = mergeDb(dbRef.current, remote.state as SocialDb);
-      syncHashRef.current = syncFingerprint(merged);
-      setDb((prev) => withLocalSession(merged, prev));
-    };
-
-    const disconnectSocket = connectSyncSocket((event) => {
-      const incomingRevision = Number(event.revision ?? 0);
-      if (event.type === 'db:updated' && incomingRevision <= remoteRevisionRef.current) return;
-      void pullRemote();
+  const mergeUsers = useCallback((incoming: User[]) => {
+    if (!incoming.length) return;
+    setDb((prev) => {
+      const map = new Map(prev.users.map((item) => [item.id, item]));
+      incoming.forEach((item) => {
+        if (!item.id) return;
+        map.set(item.id, { ...(map.get(item.id) || item), ...item });
+      });
+      return { ...prev, users: Array.from(map.values()) };
     });
+  }, []);
 
-    const timer = window.setInterval(() => {
-      void pullRemote();
-    }, 8000);
+  const hydrateMe = useCallback(async () => {
+    if (!token) return;
+    try {
+      const meData = await apiRequest('/api/users/me', { method: 'GET' }, true);
+      const me = toUser(meData.user);
+      setDb((prev) => {
+        const others = prev.users.filter((item) => item.id !== me.id);
+        return {
+          ...prev,
+          users: [me, ...others],
+          session: {
+            ...prev.session,
+            userId: me.id,
+          },
+        };
+      });
+    } catch {
+      // fallback: keep token if me endpoint unavailable, will rely on login payload
+    }
+  }, [apiRequest, token]);
 
-    return () => {
-      pullAbortRef.current?.abort();
-      disconnectSocket();
-      window.clearInterval(timer);
+  const fetchFeed = useCallback(async () => {
+    try {
+      const payload = await apiRequest('/api/posts/feed?limit=50&offset=0', {}, false);
+      const nextPosts = (payload.items || []).map(toPost);
+      const authorUsers = (payload.items || [])
+        .map((item: any) => item.author)
+        .filter(Boolean)
+        .map((raw: any) => toUser({ ...raw, isVerified: Boolean(raw?.isVerified || raw?.verified) }));
+
+      mergeUsers(authorUsers);
+      setDb((prev) => ({ ...prev, posts: nextPosts }));
+    } catch {
+      // keep current data
+    }
+  }, [apiRequest, mergeUsers]);
+
+  const fetchUsers = useCallback(async () => {
+    try {
+      const payload = await apiRequest('/api/users?limit=50&offset=0', {}, false);
+      const nextUsers = (payload.items || []).map((item: any) => toUser(item));
+      mergeUsers(nextUsers);
+    } catch {
+      // keep current data
+    }
+  }, [apiRequest, mergeUsers]);
+
+  const fetchFollows = useCallback(async () => {
+    if (!token) return;
+    try {
+      const payload = await apiRequest('/api/follows/me', {}, true);
+      setDb((prev) => ({ ...prev, follows: payload.items || [] }));
+    } catch {
+      // keep current follows
+    }
+  }, [apiRequest, token]);
+
+  const fetchMessagesWith = useCallback(
+    async (otherUserId: string) => {
+      if (!token || !db.session.userId || !otherUserId) return;
+      try {
+        const payload = await apiRequest(`/api/messages/${otherUserId}?limit=100&offset=0`, {}, true);
+        const mapped = (payload.items || []).map((item: any) => toMessage(item, db.session.userId || ''));
+        setDb((prev) => {
+          const keep = prev.messages.filter(
+            (message) =>
+              !(
+                (message.fromId === otherUserId && message.toId === prev.session.userId) ||
+                (message.fromId === prev.session.userId && message.toId === otherUserId)
+              )
+          );
+          return { ...prev, messages: [...keep, ...mapped] };
+        });
+      } catch {
+        // keep current messages
+      }
+    },
+    [apiRequest, token, db.session.userId]
+  );
+
+  const closeSocket = useCallback(() => {
+    if (wsTimerRef.current) {
+      window.clearTimeout(wsTimerRef.current);
+      wsTimerRef.current = null;
+    }
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+  }, []);
+
+  const openSocket = useCallback(() => {
+    if (!token || typeof window === 'undefined') return;
+    closeSocket();
+
+    const endpoint = apiUrl('/ws');
+    const wsUrl = endpoint.startsWith('https://')
+      ? endpoint.replace('https://', 'wss://')
+      : endpoint.startsWith('http://')
+        ? endpoint.replace('http://', 'ws://')
+        : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
+
+    const socket = new WebSocket(`${wsUrl}?token=${encodeURIComponent(token)}`);
+    wsRef.current = socket;
+
+    socket.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(String(event.data));
+        if (payload?.type !== 'message:new') return;
+        const me = db.session.userId;
+        if (!me) return;
+        const message = toMessage(payload.message, me);
+        setDb((prev) => {
+          if (prev.messages.some((item) => item.id === message.id)) return prev;
+          return { ...prev, messages: [message, ...prev.messages] };
+        });
+      } catch {
+        // ignore malformed ws payload
+      }
     };
-  }, [remoteEnabled, remoteSynced]);
+
+    socket.onclose = () => {
+      wsRef.current = null;
+      if (!token) return;
+      wsTimerRef.current = window.setTimeout(() => {
+        openSocket();
+      }, 1500);
+    };
+  }, [closeSocket, db.session.userId, token]);
 
   useEffect(() => {
-    if (db.theme === 'dark') {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
+    if (typeof window === 'undefined') return;
+    if (!token) {
+      closeSocket();
+      return;
     }
+    openSocket();
+    return () => {
+      closeSocket();
+    };
+  }, [token, openSocket, closeSocket]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (token) {
+      localStorage.setItem(TOKEN_KEY, token);
+    } else {
+      localStorage.removeItem(TOKEN_KEY);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(THEME_KEY, db.theme);
   }, [db.theme]);
 
   useEffect(() => {
-    if (!user || !user.banned) return;
-    setDb((prev) => {
-      if (prev.session.userId !== user.id) return prev;
-      return {
-        ...prev,
-        session: {
-          ...prev.session,
-          userId: null,
-          currentView: 'feed',
-          activeChatUserId: null,
-        },
-      };
-    });
-  }, [user]);
+    if (typeof window === 'undefined') return;
+    if (pendingVerificationUserId) {
+      localStorage.setItem(PENDING_VERIFY_USER_KEY, pendingVerificationUserId);
+    } else {
+      localStorage.removeItem(PENDING_VERIFY_USER_KEY);
+    }
+  }, [pendingVerificationUserId]);
 
   useEffect(() => {
-    if (!user) return;
-    const touch = () => {
-      const nowMs = Date.now();
-      if (nowMs - lastPresenceUpdateRef.current < 25000) return;
-      const nowIso = new Date(nowMs).toISOString();
-      setDb((prev) => {
-        const index = prev.users.findIndex((candidate) => candidate.id === user.id);
-        if (index < 0) return prev;
-        const target = prev.users[index];
-        if (nowMs - new Date(target.lastSeenAt || 0).getTime() < 25000) return prev;
-        const nextUsers = [...prev.users];
-        nextUsers[index] = { ...target, lastSeenAt: nowIso };
-        lastPresenceUpdateRef.current = nowMs;
-        return {
-          ...prev,
-          users: nextUsers,
-        };
-      });
-    };
-
-    touch();
-    const timer = window.setInterval(touch, 30000);
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') touch();
-    };
-    document.addEventListener('visibilitychange', onVisible);
-    return () => {
-      window.clearInterval(timer);
-      document.removeEventListener('visibilitychange', onVisible);
-    };
-  }, [user]);
+    if (!token) return;
+    void hydrateMe();
+    void fetchFeed();
+    void fetchUsers();
+    void fetchFollows();
+  }, [token, hydrateMe, fetchFeed, fetchUsers, fetchFollows]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      setDb((prev) => {
-        const nextMessages = prev.messages.filter((message) => {
-          if (message.mediaType !== 'voice' || !message.expiresAt) return true;
-          return new Date(message.expiresAt).getTime() > Date.now();
-        });
-        if (nextMessages.length === prev.messages.length) return prev;
-        return {
-          ...prev,
-          messages: nextMessages,
-        };
-      });
-    }, 60000);
-
-    return () => window.clearInterval(timer);
-  }, []);
-
-  const addNotification = (
-    prev: SocialDb,
-    payload: Omit<NotificationItem, 'id' | 'createdAt' | 'read'>
-  ): SocialDb => ({
-    ...prev,
-    notifications: [
-      {
-        id: makeId('notif'),
-        createdAt: new Date().toISOString(),
-        read: false,
-        ...payload,
-      },
-      ...prev.notifications,
-    ],
-  });
-
-  const extractMentionedUsers = (text: string, usersList: User[]) => {
-    const matches = [...text.matchAll(/@([a-zA-Z0-9_]+)/g)];
-    const usernames = [...new Set(matches.map((match) => match[1].toLowerCase()))];
-    return usersList.filter((candidate) => usernames.includes(candidate.username.toLowerCase()));
-  };
+    if (!activeChatUserId) return;
+    void fetchMessagesWith(activeChatUserId);
+  }, [activeChatUserId, fetchMessagesWith]);
 
   const register = (payload: RegisterPayload): ActionResult => {
-    const username = payload.username.trim().toLowerCase();
-    const displayName = payload.displayName.trim();
-    const password = payload.password.trim();
+    const username = String(payload.username || '').trim().toLowerCase();
+    const displayName = String(payload.displayName || username).trim();
+    const email = String(payload.email || `${username}@aura.local`).trim().toLowerCase();
+    const password = String(payload.password || '');
 
-    if (username.length < 3) return fail('Username must contain at least 3 characters.');
-    if (displayName.length < 2) return fail('Display name must contain at least 2 characters.');
-    if (password.length < 3) return fail('Password must contain at least 3 characters.');
-    if (db.users.some((candidate) => candidate.username.toLowerCase() === username)) {
-      return fail('This username is already taken.');
-    }
+    if (!username || !password) return fail('Username and password are required.');
 
-    const createdAt = new Date().toISOString();
-    const newUser: User = {
-      id: makeId('user'),
-      username,
-      password,
-      displayName,
-      bio: '',
-      status: '',
-      avatar: '',
-      coverImage: '',
-      role: 'user',
-      banned: false,
-      restricted: false,
-      verified: false,
-      hiddenFromFriends: false,
-      createdAt,
-      updatedAt: createdAt,
-      lastSeenAt: createdAt,
-    };
+    void (async () => {
+      try {
+        const data = await apiRequest(
+          '/api/auth/register',
+          {
+            method: 'POST',
+            body: JSON.stringify({ username, displayName, email, password }),
+          },
+          false
+        );
 
-    setDb((prev) => {
-      return {
-        ...prev,
-        users: [newUser, ...prev.users],
-        session: {
-          ...prev.session,
-          userId: newUser.id,
-          currentView: 'feed' as AppView,
-        },
-      };
-    });
+        if (data.requiresVerification && data.userId) {
+          setPendingVerificationUserId(String(data.userId));
+          return;
+        }
 
-    return ok('Registration complete. You are now logged in.');
+        if (data.token && data.user) {
+          const mapped = toUser(data.user);
+          setToken(String(data.token));
+          setDb((prev) => ({
+            ...prev,
+            users: [mapped, ...prev.users.filter((item) => item.id !== mapped.id)],
+            session: { ...prev.session, userId: mapped.id },
+          }));
+        }
+      } catch {
+        // handled by immediate return path
+      }
+    })();
+
+    return ok('Account created. Enter the code from your email.');
+  };
+
+  const verifyPending = (code: string): ActionResult => {
+    const trimmed = String(code || '').trim();
+    if (!pendingVerificationUserId) return fail('No pending verification.');
+    if (trimmed.length < 4) return fail('Enter verification code.');
+
+    void (async () => {
+      try {
+        const data = await apiRequest(
+          '/api/auth/verify',
+          {
+            method: 'POST',
+            body: JSON.stringify({ userId: pendingVerificationUserId, code: trimmed }),
+          },
+          false
+        );
+
+        if (data.token && data.user) {
+          const mapped = toUser(data.user);
+          setToken(String(data.token));
+          setPendingVerificationUserId('');
+          setDb((prev) => ({
+            ...prev,
+            users: [mapped, ...prev.users.filter((item) => item.id !== mapped.id)],
+            session: { ...prev.session, userId: mapped.id },
+          }));
+          await fetchFeed();
+          await fetchUsers();
+          await fetchFollows();
+        }
+      } catch {
+        // handled by return value
+      }
+    })();
+
+    return ok('Verification submitted.');
   };
 
   const login = (payload: LoginPayload): ActionResult => {
-    const username = payload.username.trim().toLowerCase();
-    const password = payload.password.trim();
-    const target = db.users.find((candidate) => candidate.username.toLowerCase() === username);
+    const username = String(payload.username || '').trim().toLowerCase();
+    const password = String(payload.password || '');
+    if (!username || !password) return fail('Missing credentials.');
 
-    if (!target || target.password !== password) {
-      return fail('Invalid username or password.');
-    }
-    if (target.banned) {
-      return fail('This account is banned.');
-    }
+    void (async () => {
+      try {
+        const data = await apiRequest(
+          '/api/auth/login',
+          {
+            method: 'POST',
+            body: JSON.stringify({ username, password }),
+          },
+          false
+        );
 
-    setDb((prev) => ({
-      ...prev,
-      users: prev.users.map((candidate) =>
-        candidate.id === target.id
-          ? { ...candidate, lastSeenAt: new Date().toISOString() }
-          : candidate
-      ),
-      session: {
-        ...prev.session,
-        userId: target.id,
-        currentView: 'feed',
-      },
-    }));
+        if (data.token && data.user) {
+          const mapped = toUser(data.user);
+          setToken(String(data.token));
+          setDb((prev) => ({
+            ...prev,
+            users: [mapped, ...prev.users.filter((item) => item.id !== mapped.id)],
+            session: { ...prev.session, userId: mapped.id },
+          }));
+          await fetchFeed();
+          await fetchUsers();
+          await fetchFollows();
+        }
+      } catch {
+        // handled by immediate status message
+      }
+    })();
 
-    return ok(target.role === 'admin' ? 'Admin session started.' : 'Successfully logged in.');
+    return ok('Login requested.');
   };
 
   const logout = () => {
-    setDb((prev) => ({
-      ...prev,
-      session: {
-        ...prev.session,
-        userId: null,
-        currentView: 'feed',
-        activeChatUserId: null,
-      },
-    }));
+    setToken('');
+    setPendingVerificationUserId('');
+    setDb((prev) => cleanDbState(prev.theme));
   };
 
   const setTheme = (theme: ThemeMode) => {
@@ -630,255 +601,133 @@ export function useStore(): UseStore {
   };
 
   const setCurrentView = (view: AppView) => {
-    if (view === 'admin' && !isAdmin(user)) return;
-    setDb((prev) => ({
-      ...prev,
-      session: { ...prev.session, currentView: view },
-    }));
+    setDb((prev) => ({ ...prev, session: { ...prev.session, currentView: view } }));
   };
 
   const setActiveChatUser = (userId: string | null) => {
-    setDb((prev) => ({
-      ...prev,
-      session: { ...prev.session, activeChatUserId: userId },
-      messages:
-        userId && user
-          ? prev.messages.map((message) => {
-              const isTarget =
-                message.toId === user.id &&
-                message.fromId === userId &&
-                !message.readBy.includes(user.id);
-              if (!isTarget) return message;
-              return { ...message, readBy: [...message.readBy, user.id] };
-            })
-          : prev.messages,
-    }));
+    setDb((prev) => ({ ...prev, session: { ...prev.session, activeChatUserId: userId } }));
   };
 
   const setActiveGroup = (groupId: string | null) => {
-    setDb((prev) => ({
-      ...prev,
-      session: { ...prev.session, activeGroupId: groupId },
-    }));
+    setDb((prev) => ({ ...prev, session: { ...prev.session, activeGroupId: groupId } }));
   };
 
   const createPost = (payload: PostPayload): ActionResult => {
-    if (!user) return fail('Please login first.');
-    if (user.restricted) return fail('Your account is restricted and cannot create posts.');
+    const text = String(payload.text || '').trim();
+    if (!text) return fail('Post text is required.');
+    if (!user) return fail('Unauthorized.');
 
-    const text = payload.text.trim();
-    const mediaUrl = payload.mediaUrl?.trim();
-    if (!text && !mediaUrl) return fail('Add text or media to create post.');
-
-    const post: Post = {
-      id: makeId('post'),
+    const optimisticPost: Post = {
+      id: `temp-${Date.now()}`,
       authorId: user.id,
       text,
-      mediaType: mediaUrl ? payload.mediaType ?? 'image' : undefined,
-      mediaUrl: mediaUrl || undefined,
-      createdAt: new Date().toISOString(),
+      mediaType: payload.mediaType,
+      mediaUrl: payload.mediaUrl,
+      createdAt: nowIso(),
       likedBy: [],
       repostedBy: [],
     };
 
-    setDb((prev) => ({ ...prev, posts: [post, ...prev.posts] }));
+    setDb((prev) => ({ ...prev, posts: [optimisticPost, ...prev.posts] }));
+
+    void (async () => {
+      try {
+        const data = await apiRequest(
+          '/api/posts',
+          { method: 'POST', body: JSON.stringify({ content: text }) },
+          true
+        );
+        const persisted = toPost(data.post);
+        setDb((prev) => ({
+          ...prev,
+          posts: [persisted, ...prev.posts.filter((item) => item.id !== optimisticPost.id)],
+        }));
+      } catch {
+        setDb((prev) => ({ ...prev, posts: prev.posts.filter((item) => item.id !== optimisticPost.id) }));
+      }
+    })();
+
     return ok('Post published.');
   };
 
   const deletePost = (postId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const post = db.posts.find((item) => item.id === postId);
-    if (!post) return fail('Post not found.');
-    if (post.authorId !== user.id && user.role !== 'admin') {
-      return fail('No access to delete this post.');
-    }
+    const existing = db.posts.find((item) => item.id === postId);
+    if (!existing) return fail('Post not found.');
 
-    setDb((prev) => {
-      const deleteIds = new Set<string>([postId]);
-      if (!post.repostOfPostId) {
-        prev.posts
-          .filter((item) => item.repostOfPostId === post.id)
-          .forEach((item) => deleteIds.add(item.id));
-      }
+    setDb((prev) => ({
+      ...prev,
+      posts: prev.posts.filter((item) => item.id !== postId),
+      postComments: prev.postComments.filter((item) => item.postId !== postId),
+    }));
 
-      return {
-        ...prev,
-        posts: prev.posts
-          .filter((item) => !deleteIds.has(item.id))
-          .map((item) =>
-            post.repostOfPostId && item.id === post.repostOfPostId
-              ? { ...item, repostedBy: item.repostedBy.filter((id) => id !== post.authorId) }
-              : item
-          ),
-        postComments: prev.postComments.filter((comment) => !deleteIds.has(comment.postId)),
-      };
+    void apiRequest(`/api/posts/${postId}`, { method: 'DELETE' }, true).catch(() => {
+      setDb((prev) => ({ ...prev, posts: [existing, ...prev.posts] }));
     });
+
     return ok('Post deleted.');
   };
 
   const togglePostLike = (postId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const post = db.posts.find((item) => item.id === postId);
-    if (!post) return fail('Post not found.');
-
-    const wasLiked = post.likedBy.includes(user.id);
-
-    setDb((prev) => {
-      const withUpdatedPost = {
-        ...prev,
-        posts: prev.posts.map((item) =>
-          item.id === postId
-            ? {
-                ...item,
-                likedBy: item.likedBy.includes(user.id)
-                  ? item.likedBy.filter((id) => id !== user.id)
-                  : [...item.likedBy, user.id],
-              }
-            : item
-        ),
-      };
-      if (wasLiked || post.authorId === user.id) return withUpdatedPost;
-      return addNotification(withUpdatedPost, {
-        userId: post.authorId,
-        actorId: user.id,
-        type: 'post_like',
-        text: `${user.displayName} liked your post.`,
-        postId: post.id,
-      });
-    });
-
-    return ok(wasLiked ? 'Like removed.' : 'Post liked.');
+    if (!user) return fail('Unauthorized.');
+    setDb((prev) => ({
+      ...prev,
+      posts: prev.posts.map((post) => {
+        if (post.id !== postId) return post;
+        const liked = post.likedBy.includes(user.id);
+        return {
+          ...post,
+          likedBy: liked ? post.likedBy.filter((id) => id !== user.id) : [...post.likedBy, user.id],
+        };
+      }),
+    }));
+    return ok('Like updated.');
   };
 
   const togglePostRepost = (postId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    if (user.restricted) return fail('Your account is restricted and cannot repost.');
-    const source = db.posts.find((item) => item.id === postId);
-    if (!source) return fail('Post not found.');
-
-    const rootId = source.repostOfPostId ?? source.id;
-    const root = db.posts.find((item) => item.id === rootId);
-    if (!root) return fail('Original post not found.');
-
-    const existingRepost = db.posts.find(
-      (item) => item.authorId === user.id && item.repostOfPostId === rootId
-    );
-
-    setDb((prev) => {
-      if (existingRepost) {
+    if (!user) return fail('Unauthorized.');
+    setDb((prev) => ({
+      ...prev,
+      posts: prev.posts.map((post) => {
+        if (post.id !== postId) return post;
+        const has = post.repostedBy.includes(user.id);
         return {
-          ...prev,
-          posts: prev.posts
-            .filter((item) => item.id !== existingRepost.id)
-            .map((item) =>
-              item.id === rootId
-                ? { ...item, repostedBy: item.repostedBy.filter((id) => id !== user.id) }
-                : item
-            ),
-          postComments: prev.postComments.filter((comment) => comment.postId !== existingRepost.id),
+          ...post,
+          repostedBy: has ? post.repostedBy.filter((id) => id !== user.id) : [...post.repostedBy, user.id],
         };
-      }
-
-      const repostPost: Post = {
-        id: makeId('post'),
-        authorId: user.id,
-        text: root.text,
-        mediaType: root.mediaType,
-        mediaUrl: root.mediaUrl,
-        createdAt: new Date().toISOString(),
-        likedBy: [],
-        repostedBy: [],
-        repostOfPostId: rootId,
-      };
-      const withRepost = {
-        ...prev,
-        posts: [repostPost, ...prev.posts].map((item) =>
-          item.id === rootId && !item.repostedBy.includes(user.id)
-            ? { ...item, repostedBy: [...item.repostedBy, user.id] }
-            : item
-        ),
-      };
-      if (root.authorId === user.id) return withRepost;
-      return addNotification(withRepost, {
-        userId: root.authorId,
-        actorId: user.id,
-        type: 'post_repost',
-        text: `${user.displayName} reposted your post.`,
-        postId: root.id,
-      });
-    });
-
-    return ok(existingRepost ? 'Repost removed.' : 'Reposted to your wall.');
+      }),
+    }));
+    return ok('Repost updated.');
   };
 
   const addPostComment = (postId: string, text: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    if (user.restricted) return fail('Your account is restricted and cannot comment.');
-    const post = db.posts.find((item) => item.id === postId);
-    if (!post) return fail('Post not found.');
-
-    const cleanText = text.trim();
-    if (!cleanText) return fail('Comment is empty.');
-
+    if (!user) return fail('Unauthorized.');
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return fail('Comment is empty.');
     const comment: PostComment = {
-      id: makeId('post-comment'),
+      id: `comment-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       postId,
       authorId: user.id,
-      text: cleanText,
+      text: trimmed,
       likedBy: [],
-      createdAt: new Date().toISOString(),
+      createdAt: nowIso(),
     };
-
-    setDb((prev) => {
-      let next: SocialDb = { ...prev, postComments: [comment, ...prev.postComments] };
-      const mentioned = extractMentionedUsers(cleanText, prev.users).filter(
-        (candidate) => candidate.id !== user.id
-      );
-      mentioned.forEach((mentionedUser) => {
-        const isReplyTarget = prev.postComments.some(
-          (item) => item.postId === postId && item.authorId === mentionedUser.id
-        );
-        next = addNotification(next, {
-          userId: mentionedUser.id,
-          actorId: user.id,
-          type: 'comment_mention',
-          text: isReplyTarget
-            ? `${user.displayName} replied to your comment.`
-            : `${user.displayName} mentioned you in a comment.`,
-          postId,
-          commentId: comment.id,
-        });
-      });
-      return next;
-    });
-
+    setDb((prev) => ({ ...prev, postComments: [comment, ...prev.postComments] }));
     return ok('Comment added.');
   };
 
   const editPostComment = (commentId: string, text: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const target = db.postComments.find((comment) => comment.id === commentId);
-    if (!target) return fail('Comment not found.');
-    if (user.role !== 'admin' && target.authorId !== user.id) return fail('Not allowed.');
-
-    const nextText = text.trim();
-    if (!nextText) return fail('Comment is empty.');
-
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return fail('Comment is empty.');
     setDb((prev) => ({
       ...prev,
       postComments: prev.postComments.map((comment) =>
-        comment.id === commentId ? { ...comment, text: nextText } : comment
+        comment.id === commentId ? { ...comment, text: trimmed } : comment
       ),
     }));
     return ok('Comment updated.');
   };
 
   const deletePostComment = (commentId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const target = db.postComments.find((comment) => comment.id === commentId);
-    if (!target) return fail('Comment not found.');
-    if (user.role !== 'admin' && target.authorId !== user.id) return fail('Not allowed.');
-
     setDb((prev) => ({
       ...prev,
       postComments: prev.postComments.filter((comment) => comment.id !== commentId),
@@ -887,206 +736,137 @@ export function useStore(): UseStore {
   };
 
   const togglePostCommentLike = (commentId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const target = db.postComments.find((comment) => comment.id === commentId);
-    if (!target) return fail('Comment not found.');
-    const liked = target.likedBy.includes(user.id);
-
+    if (!user) return fail('Unauthorized.');
     setDb((prev) => ({
       ...prev,
-      postComments: prev.postComments.map((comment) =>
-        comment.id === commentId
-          ? {
-              ...comment,
-              likedBy: liked
-                ? comment.likedBy.filter((id) => id !== user.id)
-                : [...comment.likedBy, user.id],
-            }
-          : comment
-      ),
+      postComments: prev.postComments.map((comment) => {
+        if (comment.id !== commentId) return comment;
+        const liked = comment.likedBy.includes(user.id);
+        return {
+          ...comment,
+          likedBy: liked ? comment.likedBy.filter((id) => id !== user.id) : [...comment.likedBy, user.id],
+        };
+      }),
     }));
-    return ok(liked ? 'Comment like removed.' : 'Comment liked.');
+    return ok('Comment like updated.');
   };
 
-  const createStory = (payload: StoryPayload): ActionResult => {
-    if (!user) return fail('Please login first.');
-    if (user.restricted) return fail('Your account is restricted and cannot add stories.');
-
-    const mediaUrl = payload.mediaUrl.trim();
-    const caption = payload.caption.trim();
-    if (!mediaUrl) return fail('Story media URL is required.');
-
-    const createdAt = new Date().toISOString();
-    const story: Story = {
-      id: makeId('story'),
-      authorId: user.id,
-      caption,
-      mediaType: payload.mediaType,
-      mediaUrl,
-      createdAt,
-      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-    };
-
-    setDb((prev) => ({ ...prev, stories: [story, ...prev.stories] }));
-    return ok('Story published.');
-  };
-
-  const deleteStory = (storyId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const story = db.stories.find((item) => item.id === storyId);
-    if (!story) return fail('Story not found.');
-    if (story.authorId !== user.id && user.role !== 'admin') {
-      return fail('No access to delete this story.');
-    }
-
-    setDb((prev) => ({
-      ...prev,
-      stories: prev.stories.filter((item) => item.id !== storyId),
-      storyComments: prev.storyComments.filter((comment) => comment.storyId !== storyId),
-    }));
-    return ok('Story deleted.');
-  };
-
-  const addStoryComment = (storyId: string, text: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    if (user.restricted) return fail('Your account is restricted and cannot reply to stories.');
-    const story = db.stories.find((item) => item.id === storyId);
-    if (!story) return fail('Story not found.');
-
-    const cleanText = text.trim();
-    if (!cleanText) return fail('Comment is empty.');
-
-    const privateReply: Message = {
-      id: makeId('msg'),
-      fromId: user.id,
-      toId: story.authorId,
-      text: `Story reply: ${cleanText}`,
-      readBy: [user.id],
-      createdAt: new Date().toISOString(),
-    };
-
-    setDb((prev) => ({
-      ...prev,
-      messages: [privateReply, ...prev.messages],
-    }));
-
-    return ok('Story reply sent to private messages.');
-  };
+  const createStory = (_payload: StoryPayload): ActionResult => fail('Stories are disabled in API mode.');
+  const deleteStory = (_storyId: string): ActionResult => fail('Stories are disabled in API mode.');
+  const addStoryComment = (_storyId: string, _text: string): ActionResult =>
+    fail('Stories are disabled in API mode.');
 
   const followUser = (targetUserId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    if (targetUserId === user.id) return fail('You cannot follow yourself.');
+    if (!user) return fail('Unauthorized.');
+    if (!targetUserId || targetUserId === user.id) return fail('Invalid user.');
 
-    const target = db.users.find((candidate) => candidate.id === targetUserId);
-    if (!target) return fail('User not found.');
-
-    const existing = db.follows.find(
+    const existing = db.follows.some(
       (relation) => relation.followerId === user.id && relation.followingId === targetUserId
     );
 
-    setDb((prev) => {
-      if (existing) {
-        return {
-          ...prev,
-          follows: prev.follows.filter((relation) => relation.id !== existing.id),
-        };
-      }
-
-      const next = {
+    if (existing) {
+      setDb((prev) => ({
         ...prev,
-        follows: [
-          {
-            id: makeId('follow'),
-            followerId: user.id,
-            followingId: targetUserId,
-            createdAt: new Date().toISOString(),
-          },
-          ...prev.follows,
-        ],
-      };
-      return addNotification(next, {
-        userId: targetUserId,
-        actorId: user.id,
-        type: 'follow',
-        text: `${user.displayName} followed you.`,
+        follows: prev.follows.filter(
+          (relation) => !(relation.followerId === user.id && relation.followingId === targetUserId)
+        ),
+      }));
+      void apiRequest(`/api/follow/${targetUserId}`, { method: 'DELETE' }, true).catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          follows: [
+            ...prev.follows,
+            {
+              id: `follow-${Date.now()}-${targetUserId}`,
+              followerId: user.id,
+              followingId: targetUserId,
+              createdAt: nowIso(),
+            },
+          ],
+        }));
       });
-    });
+      return ok('Unfollowed.');
+    }
 
-    return ok(existing ? 'Unfollowed.' : 'Followed user.');
+    const optimistic = {
+      id: `follow-${Date.now()}-${targetUserId}`,
+      followerId: user.id,
+      followingId: targetUserId,
+      createdAt: nowIso(),
+    };
+
+    setDb((prev) => ({ ...prev, follows: [...prev.follows, optimistic] }));
+    void apiRequest(`/api/follow/${targetUserId}`, { method: 'POST' }, true).catch(() => {
+      setDb((prev) => ({
+        ...prev,
+        follows: prev.follows.filter((relation) => relation.id !== optimistic.id),
+      }));
+    });
+    return ok('Followed.');
   };
 
   const sendMessage = (
     toUserId: string,
     payload: { text?: string; mediaType?: 'image' | 'voice'; mediaUrl?: string; expiresAt?: string }
   ): ActionResult => {
-    if (!user) return fail('Please login first.');
-    if (user.restricted) return fail('Your account is restricted and cannot send messages.');
-    if (toUserId === user.id) return fail('Choose another user.');
-    const receiver = db.users.find((candidate) => candidate.id === toUserId);
-    if (!receiver) return fail('Recipient not found.');
+    if (!user) return fail('Unauthorized.');
 
-    const cleanText = (payload.text || '').trim();
-    const cleanMediaUrl = (payload.mediaUrl || '').trim();
-    if (!cleanText && !cleanMediaUrl) return fail('Message is empty.');
-    if (cleanMediaUrl.startsWith('data:') && cleanMediaUrl.length > 2_500_000) {
-      return fail('Media file is too large. Please send a smaller file.');
-    }
+    const content = String(payload.text || payload.mediaUrl || '').trim();
+    if (!content) return fail('Message is empty.');
 
-    const message: Message = {
-      id: makeId('msg'),
+    const optimistic: Message = {
+      id: `tmp-msg-${Date.now()}`,
       fromId: user.id,
       toId: toUserId,
-      text: cleanText,
-      mediaType: cleanMediaUrl ? payload.mediaType : undefined,
-      mediaUrl: cleanMediaUrl || undefined,
-      expiresAt: payload.mediaType === 'voice' ? payload.expiresAt : undefined,
+      text: String(payload.text || ''),
+      mediaType: payload.mediaType === 'voice' ? 'voice' : payload.mediaType,
+      mediaUrl: payload.mediaUrl,
+      expiresAt: payload.expiresAt,
+      createdAt: nowIso(),
       readBy: [user.id],
-      createdAt: new Date().toISOString(),
     };
 
-    setDb((prev) => ({
-      ...prev,
-      messages: [message, ...prev.messages],
-      session: { ...prev.session, activeChatUserId: toUserId },
-    }));
+    setDb((prev) => ({ ...prev, messages: [optimistic, ...prev.messages] }));
+
+    void (async () => {
+      try {
+        const data = await apiRequest(
+          '/api/messages',
+          {
+            method: 'POST',
+            body: JSON.stringify({ receiverId: toUserId, content }),
+          },
+          true
+        );
+
+        if (!user.id) return;
+        const persisted = toMessage(data.message, user.id);
+        setDb((prev) => ({
+          ...prev,
+          messages: [persisted, ...prev.messages.filter((item) => item.id !== optimistic.id)],
+        }));
+      } catch {
+        setDb((prev) => ({ ...prev, messages: prev.messages.filter((item) => item.id !== optimistic.id) }));
+      }
+    })();
 
     return ok('Message sent.');
   };
 
   const editMessage = (messageId: string, text: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const cleanText = text.trim();
-    if (!cleanText) return fail('Message is empty.');
-    const target = db.messages.find((message) => message.id === messageId);
-    if (!target) return fail('Message not found.');
-    if (target.fromId !== user.id) return fail('You can only edit your own message.');
-    if (target.mediaType && target.mediaType !== 'image') {
-      return fail('Only text/image messages can be edited.');
-    }
-
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return fail('Message is empty.');
     setDb((prev) => ({
       ...prev,
       messages: prev.messages.map((message) =>
-        message.id === messageId
-          ? { ...message, text: cleanText, editedAt: new Date().toISOString() }
-          : message
+        message.id === messageId ? { ...message, text: trimmed, editedAt: nowIso() } : message
       ),
     }));
     return ok('Message edited.');
   };
 
   const deleteMessage = (messageId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const target = db.messages.find((message) => message.id === messageId);
-    if (!target) return fail('Message not found.');
-    if (target.fromId !== user.id && user.role !== 'admin') {
-      return fail('You can only delete your own message.');
-    }
-
-    setDb((prev) => ({
-      ...prev,
-      messages: prev.messages.filter((message) => message.id !== messageId),
-    }));
+    setDb((prev) => ({ ...prev, messages: prev.messages.filter((message) => message.id !== messageId) }));
     return ok('Message deleted.');
   };
 
@@ -1095,9 +875,8 @@ export function useStore(): UseStore {
     setDb((prev) => ({
       ...prev,
       messages: prev.messages.map((message) => {
-        const isTarget =
-          message.toId === user.id && message.fromId === chatUserId && !message.readBy.includes(user.id);
-        if (!isTarget) return message;
+        if (!(message.fromId === chatUserId && message.toId === user.id)) return message;
+        if (message.readBy.includes(user.id)) return message;
         return { ...message, readBy: [...message.readBy, user.id] };
       }),
     }));
@@ -1114,10 +893,11 @@ export function useStore(): UseStore {
   };
 
   const updateProfile = (patch: ProfilePatch): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const displayName = patch.displayName.trim();
-    if (displayName.length < 2) return fail('Display name is too short.');
-    const nowIso = new Date().toISOString();
+    if (!user) return fail('Unauthorized.');
+
+    const displayName = String(patch.displayName || user.displayName).trim();
+    const bio = String(patch.bio || '');
+    const avatarUrl = String(patch.avatar || '');
 
     setDb((prev) => ({
       ...prev,
@@ -1126,586 +906,85 @@ export function useStore(): UseStore {
           ? {
               ...candidate,
               displayName,
-              bio: patch.bio.trim(),
-              status: patch.status.trim(),
-              avatar: patch.avatar.trim(),
-              coverImage: patch.coverImage.trim(),
-              hiddenFromFriends: patch.hiddenFromFriends,
-              updatedAt: nowIso,
-              lastSeenAt: nowIso,
+              bio,
+              avatar: avatarUrl,
+              coverImage: patch.coverImage || candidate.coverImage,
+              hiddenFromFriends: Boolean(patch.hiddenFromFriends),
+              updatedAt: nowIso(),
             }
           : candidate
       ),
     }));
+
+    void apiRequest(
+      '/api/users/me',
+      {
+        method: 'PUT',
+        body: JSON.stringify({ displayName, bio, avatarUrl }),
+      },
+      true
+    ).catch(() => {
+      // keep optimistic profile in UI
+    });
+
     return ok('Profile updated.');
   };
 
-  const createGroup = (payload: GroupPayload): ActionResult => {
-    if (!user) return fail('Please login first.');
-    if (user.restricted) return fail('Your account is restricted and cannot create groups.');
-    const name = payload.name.trim();
-    const description = payload.description.trim();
-    if (name.length < 3) return fail('Group name must contain at least 3 characters.');
-    if (db.groups.some((group) => group.name.toLowerCase() === name.toLowerCase())) {
-      return fail('Group with this name already exists.');
-    }
-
-    const groupId = makeId('group');
-    const group: Group = {
-      id: groupId,
-      name,
-      description,
-      adminId: user.id,
-      allowMemberPosts: payload.allowMemberPosts,
-      avatar: `https://picsum.photos/seed/${encodeURIComponent(groupId)}-avatar/200/200`,
-      coverImage: `https://picsum.photos/seed/${encodeURIComponent(groupId)}-cover/1400/420`,
-      verified: false,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    const member: GroupMember = {
-      id: makeId('group-member'),
-      groupId,
-      userId: user.id,
-      role: 'admin',
-      createdAt: new Date().toISOString(),
-    };
-
-    setDb((prev) => ({
-      ...prev,
-      groups: [group, ...prev.groups],
-      groupMembers: [member, ...prev.groupMembers],
-      session: {
-        ...prev.session,
-        currentView: 'groups',
-        activeGroupId: groupId,
-      },
-    }));
-    return ok('Group created.');
-  };
-
-  const updateGroup = (groupId: string, patch: GroupPatch): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const group = db.groups.find((candidate) => candidate.id === groupId);
-    if (!group) return fail('Group not found.');
-    if (!canManageGroup(group)) return fail('Only group admin can edit group.');
-
-    const nextName = patch.name.trim();
-    const nextDescription = patch.description.trim();
-    if (nextName.length < 3) return fail('Group name must contain at least 3 characters.');
-    if (
-      db.groups.some(
-        (candidate) =>
-          candidate.id !== groupId && candidate.name.toLowerCase() === nextName.toLowerCase()
-      )
-    ) {
-      return fail('Group with this name already exists.');
-    }
-
-    const canSetVerified = user.role === 'admin';
-    const nowIso = new Date().toISOString();
-
-    setDb((prev) => ({
-      ...prev,
-      groups: prev.groups.map((candidate) =>
-        candidate.id === groupId
-          ? {
-              ...candidate,
-              name: nextName,
-              description: nextDescription,
-              avatar: patch.avatar.trim(),
-              coverImage: patch.coverImage.trim(),
-              allowMemberPosts: patch.allowMemberPosts,
-              verified: canSetVerified ? patch.verified : candidate.verified,
-              updatedAt: nowIso,
-            }
-          : candidate
-      ),
-    }));
-    return ok('Group updated.');
-  };
-
-  const canManageGroup = (group: Group) =>
-    Boolean(user && (group.adminId === user.id || user.role === 'admin'));
-
-  const toggleGroupSubscription = (groupId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const group = db.groups.find((candidate) => candidate.id === groupId);
-    if (!group) return fail('Group not found.');
-
-    const existing = db.groupMembers.find(
-      (member) => member.groupId === groupId && member.userId === user.id
-    );
-    if (existing?.role === 'admin' && group.adminId === user.id) {
-      return fail('Group admin cannot leave own group.');
-    }
-
-    setDb((prev) => {
-      if (existing) {
-        return {
-          ...prev,
-          groupMembers: prev.groupMembers.filter((member) => member.id !== existing.id),
-        };
-      }
-      const member: GroupMember = {
-        id: makeId('group-member'),
-        groupId,
-        userId: user.id,
-        role: 'member',
-        createdAt: new Date().toISOString(),
-      };
-      const withMember = {
-        ...prev,
-        groupMembers: [member, ...prev.groupMembers],
-      };
-      return withMember;
-    });
-
-    return ok(existing ? 'Unsubscribed from group.' : 'Subscribed to group.');
-  };
-
-  const setGroupAllowMemberPosts = (groupId: string, allow: boolean): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const group = db.groups.find((candidate) => candidate.id === groupId);
-    if (!group) return fail('Group not found.');
-    if (!canManageGroup(group)) {
-      return fail('Only group admin can change this setting.');
-    }
-
-    const nowIso = new Date().toISOString();
-    setDb((prev) => ({
-      ...prev,
-      groups: prev.groups.map((candidate) =>
-        candidate.id === groupId
-          ? { ...candidate, allowMemberPosts: allow, updatedAt: nowIso }
-          : candidate
-      ),
-    }));
-    return ok(allow ? 'Members can publish in this group.' : 'Only admin can publish in this group.');
-  };
-
+  const createGroup = (_payload: GroupPayload): ActionResult => fail('Groups are disabled in API mode.');
+  const updateGroup = (_groupId: string, _patch: GroupPatch): ActionResult => fail('Groups are disabled in API mode.');
+  const toggleGroupSubscription = (_groupId: string): ActionResult => fail('Groups are disabled in API mode.');
+  const setGroupAllowMemberPosts = (_groupId: string, _allow: boolean): ActionResult =>
+    fail('Groups are disabled in API mode.');
   const createGroupPost = (
-    groupId: string,
-    text: string,
-    mediaType?: MediaType,
-    mediaUrl?: string
-  ): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const group = db.groups.find((candidate) => candidate.id === groupId);
-    if (!group) return fail('Group not found.');
+    _groupId: string,
+    _text: string,
+    _mediaType?: MediaType,
+    _mediaUrl?: string
+  ): ActionResult => fail('Groups are disabled in API mode.');
+  const toggleGroupPostLike = (_groupPostId: string): ActionResult => fail('Groups are disabled in API mode.');
+  const repostGroupPost = (_groupPostId: string, _targetGroupId: string): ActionResult =>
+    fail('Groups are disabled in API mode.');
+  const repostGroupPostToProfile = (_groupPostId: string): ActionResult =>
+    fail('Groups are disabled in API mode.');
+  const publishGroupPostToFeed = (_groupPostId: string): ActionResult =>
+    fail('Groups are disabled in API mode.');
+  const editGroupPost = (_groupPostId: string, _text: string): ActionResult => fail('Groups are disabled in API mode.');
+  const deleteGroupPost = (_groupPostId: string): ActionResult => fail('Groups are disabled in API mode.');
+  const addGroupPostComment = (_groupPostId: string, _text: string): ActionResult =>
+    fail('Groups are disabled in API mode.');
+  const editGroupPostComment = (_commentId: string, _text: string): ActionResult =>
+    fail('Groups are disabled in API mode.');
+  const deleteGroupPostComment = (_commentId: string): ActionResult => fail('Groups are disabled in API mode.');
+  const toggleGroupPostCommentLike = (_commentId: string): ActionResult =>
+    fail('Groups are disabled in API mode.');
 
-    const member = db.groupMembers.find(
-      (candidate) => candidate.groupId === groupId && candidate.userId === user.id
-    );
-    if (!member) return fail('Subscribe to the group first.');
-    if (member.role !== 'admin' && !group.allowMemberPosts && user.role !== 'admin') {
-      return fail('Only group admin can post right now.');
-    }
-
-    const cleanText = text.trim();
-    const cleanMedia = (mediaUrl || '').trim();
-    if (!cleanText && !cleanMedia) return fail('Post text is empty.');
-
-    const post: GroupPost = {
-      id: makeId('group-post'),
-      groupId,
-      authorId: user.id,
-      text: cleanText,
-      mediaType: cleanMedia ? mediaType ?? 'image' : undefined,
-      mediaUrl: cleanMedia || undefined,
-      createdAt: new Date().toISOString(),
-      likedBy: [],
-      repostedBy: [],
-    };
-
-    setDb((prev) => ({
-      ...prev,
-      groupPosts: [post, ...prev.groupPosts],
-    }));
-    return ok('Group post published.');
-  };
-
-  const toggleGroupPostLike = (groupPostId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const target = db.groupPosts.find((post) => post.id === groupPostId);
-    if (!target) return fail('Group post not found.');
-
-    const liked = target.likedBy.includes(user.id);
-    setDb((prev) => {
-      const withLike = {
-        ...prev,
-        groupPosts: prev.groupPosts.map((post) =>
-          post.id === groupPostId
-            ? {
-                ...post,
-                likedBy: liked
-                  ? post.likedBy.filter((id) => id !== user.id)
-                  : [...post.likedBy, user.id],
-              }
-            : post
-        ),
-      };
-
-      if (liked || target.authorId === user.id) return withLike;
-      return addNotification(withLike, {
-        userId: target.authorId,
-        actorId: user.id,
-        type: 'group_post_like',
-        text: `${user.displayName} liked your group post.`,
-        groupPostId: target.id,
-        groupId: target.groupId,
-      });
-    });
-    return ok(liked ? 'Like removed.' : 'Group post liked.');
-  };
-
-  const repostGroupPost = (groupPostId: string, targetGroupId: string): ActionResult => {
-    // Backward-compatible wrapper: group reposts now go to personal profile.
-    void targetGroupId;
-    return repostGroupPostToProfile(groupPostId);
-  };
-
-  const repostGroupPostToProfile = (groupPostId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    if (user.restricted) return fail('Your account is restricted and cannot repost.');
-    const source = db.groupPosts.find((post) => post.id === groupPostId);
-    if (!source) return fail('Original post not found.');
-    const group = db.groups.find((candidate) => candidate.id === source.groupId);
-    if (!group) return fail('Source group not found.');
-
-    const rootId = source.repostOfPostId ?? source.id;
-    const root = db.groupPosts.find((post) => post.id === rootId);
-    if (!root) return fail('Original post not found.');
-
-    const existingReposts = db.posts.filter(
-      (post) => post.authorId === user.id && post.repostOfGroupPostId === rootId
-    );
-    const hasExistingRepost = existingReposts.length > 0;
-
-    setDb((prev) => {
-      if (hasExistingRepost) {
-        const deleteIds = new Set(
-          prev.posts
-            .filter((post) => post.authorId === user.id && post.repostOfGroupPostId === rootId)
-            .map((post) => post.id)
-        );
-        return {
-          ...prev,
-          posts: prev.posts.filter((post) => !deleteIds.has(post.id)),
-          postComments: prev.postComments.filter((comment) => !deleteIds.has(comment.postId)),
-          groupPosts: prev.groupPosts.map((post) =>
-            post.id === rootId
-              ? { ...post, repostedBy: post.repostedBy.filter((id) => id !== user.id) }
-              : post
-          ),
-        };
-      }
-
-      const repost: Post = {
-        id: makeId('post'),
-        authorId: user.id,
-        text: root.text,
-        mediaType: root.mediaType,
-        mediaUrl: root.mediaUrl,
-        createdAt: new Date().toISOString(),
-        likedBy: [],
-        repostedBy: [],
-        repostOfGroupPostId: rootId,
-        repostSourceGroupId: group.id,
-      };
-
-      return {
-        ...prev,
-        posts: [
-          repost,
-          ...prev.posts.filter(
-            (post) => !(post.authorId === user.id && post.repostOfGroupPostId === rootId)
-          ),
-        ],
-        groupPosts: prev.groupPosts.map((post) =>
-          post.id === rootId && !post.repostedBy.includes(user.id)
-            ? { ...post, repostedBy: [...post.repostedBy, user.id] }
-            : post
-        ),
-      };
-    });
-
-    return ok(hasExistingRepost ? 'Repost removed from your profile.' : 'Reposted to your profile.');
-  };
-
-  const publishGroupPostToFeed = (groupPostId: string): ActionResult => {
-    void groupPostId;
-    return fail('Publishing group posts to main wall is disabled. Use repost to profile.');
-  };
-
-  const editGroupPost = (groupPostId: string, text: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const target = db.groupPosts.find((post) => post.id === groupPostId);
-    if (!target) return fail('Group post not found.');
-    const group = db.groups.find((candidate) => candidate.id === target.groupId);
-    if (!group) return fail('Group not found.');
-
-    const canManage = target.authorId === user.id || canManageGroup(group);
-    if (!canManage) return fail('Only group admin or post author can edit this post.');
-
-    const cleanText = text.trim();
-    if (!cleanText && !target.mediaUrl) return fail('Post text is empty.');
-
-    setDb((prev) => ({
-      ...prev,
-      groupPosts: prev.groupPosts.map((post) =>
-        post.id === groupPostId ? { ...post, text: cleanText } : post
-      ),
-    }));
-    return ok('Group post updated.');
-  };
-
-  const deleteGroupPost = (groupPostId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const target = db.groupPosts.find((post) => post.id === groupPostId);
-    if (!target) return fail('Group post not found.');
-    const group = db.groups.find((candidate) => candidate.id === target.groupId);
-    if (!group) return fail('Group not found.');
-
-    const canManage = target.authorId === user.id || canManageGroup(group);
-    if (!canManage) return fail('Only group admin or post author can delete this post.');
-
-    setDb((prev) => ({
-      ...prev,
-      groupPosts: prev.groupPosts.filter((post) => post.id !== groupPostId),
-      groupPostComments: prev.groupPostComments.filter((comment) => comment.groupPostId !== groupPostId),
-      posts: prev.posts.filter((post) => post.repostOfGroupPostId !== groupPostId),
-    }));
-    return ok('Group post deleted.');
-  };
-
-  const addGroupPostComment = (groupPostId: string, text: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const post = db.groupPosts.find((candidate) => candidate.id === groupPostId);
-    if (!post) return fail('Group post not found.');
-
-    const cleanText = text.trim();
-    if (!cleanText) return fail('Comment is empty.');
-
-    const comment: GroupPostComment = {
-      id: makeId('group-comment'),
-      groupPostId,
-      authorId: user.id,
-      text: cleanText,
-      likedBy: [],
-      createdAt: new Date().toISOString(),
-    };
-
-    setDb((prev) => {
-      let next: SocialDb = {
-        ...prev,
-        groupPostComments: [comment, ...prev.groupPostComments],
-      };
-      const mentioned = extractMentionedUsers(cleanText, prev.users).filter(
-        (candidate) => candidate.id !== user.id
-      );
-      mentioned.forEach((mentionedUser) => {
-        const isReplyTarget = prev.groupPostComments.some(
-          (item) => item.groupPostId === groupPostId && item.authorId === mentionedUser.id
-        );
-        next = addNotification(next, {
-          userId: mentionedUser.id,
-          actorId: user.id,
-          type: 'comment_mention',
-          text: isReplyTarget
-            ? `${user.displayName} replied to your comment in group.`
-            : `${user.displayName} mentioned you in a group comment.`,
-          groupPostId,
-          groupId: post.groupId,
-          commentId: comment.id,
-        });
-      });
-      return next;
-    });
-    return ok('Comment added to group post.');
-  };
-
-  const editGroupPostComment = (commentId: string, text: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const target = db.groupPostComments.find((comment) => comment.id === commentId);
-    if (!target) return fail('Comment not found.');
-    const groupPost = db.groupPosts.find((post) => post.id === target.groupPostId);
-    const group = groupPost ? db.groups.find((item) => item.id === groupPost.groupId) : null;
-    const canManage =
-      user.role === 'admin' ||
-      target.authorId === user.id ||
-      (group && group.adminId === user.id);
-    if (!canManage) return fail('Not allowed.');
-
-    const nextText = text.trim();
-    if (!nextText) return fail('Comment is empty.');
-
-    setDb((prev) => ({
-      ...prev,
-      groupPostComments: prev.groupPostComments.map((comment) =>
-        comment.id === commentId ? { ...comment, text: nextText } : comment
-      ),
-    }));
-    return ok('Comment updated.');
-  };
-
-  const deleteGroupPostComment = (commentId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const target = db.groupPostComments.find((comment) => comment.id === commentId);
-    if (!target) return fail('Comment not found.');
-    const groupPost = db.groupPosts.find((post) => post.id === target.groupPostId);
-    const group = groupPost ? db.groups.find((item) => item.id === groupPost.groupId) : null;
-    const canManage =
-      user.role === 'admin' ||
-      target.authorId === user.id ||
-      (group && group.adminId === user.id);
-    if (!canManage) return fail('Not allowed.');
-
-    setDb((prev) => ({
-      ...prev,
-      groupPostComments: prev.groupPostComments.filter((comment) => comment.id !== commentId),
-    }));
-    return ok('Comment deleted.');
-  };
-
-  const toggleGroupPostCommentLike = (commentId: string): ActionResult => {
-    if (!user) return fail('Please login first.');
-    const target = db.groupPostComments.find((comment) => comment.id === commentId);
-    if (!target) return fail('Comment not found.');
-    const liked = target.likedBy.includes(user.id);
-    setDb((prev) => ({
-      ...prev,
-      groupPostComments: prev.groupPostComments.map((comment) =>
-        comment.id === commentId
-          ? {
-              ...comment,
-              likedBy: liked
-                ? comment.likedBy.filter((id) => id !== user.id)
-                : [...comment.likedBy, user.id],
-            }
-          : comment
-      ),
-    }));
-    return ok(liked ? 'Comment like removed.' : 'Comment liked.');
-  };
-
-  const setUserRole = (userId: string, role: UserRole): ActionResult => {
-    if (!isAdmin(user)) return fail('Admin access required.');
-    const target = db.users.find((candidate) => candidate.id === userId);
-    if (!target) return fail('User not found.');
-
-    const nowIso = new Date().toISOString();
-    setDb((prev) => {
-      const next = {
-        ...prev,
-        users: prev.users.map((candidate) =>
-          candidate.id === userId ? { ...candidate, role, updatedAt: nowIso } : candidate
-        ),
-      };
-      return addNotification(next, {
-        userId,
-        actorId: user?.id,
-        type: 'moderation',
-        text: `Your role has been changed to ${role}.`,
-      });
-    });
-    return ok('Role updated.');
-  };
-
-  const setUserBan = (userId: string, banned: boolean): ActionResult => {
-    if (!isAdmin(user)) return fail('Admin access required.');
-    const target = db.users.find((candidate) => candidate.id === userId);
-    if (!target) return fail('User not found.');
-
-    const nowIso = new Date().toISOString();
-    setDb((prev) => {
-      const next: SocialDb = {
-        ...prev,
-        users: prev.users.map((candidate) =>
-          candidate.id === userId
-            ? { ...candidate, banned, updatedAt: nowIso }
-            : candidate
-        ),
-        session:
-          prev.session.userId === userId && banned
-            ? { ...prev.session, userId: null, currentView: 'feed', activeChatUserId: null }
-            : prev.session,
-      };
-      return addNotification(next, {
-        userId,
-        actorId: user?.id,
-        type: 'moderation',
-        text: banned ? 'Your account has been banned.' : 'Your account ban was removed.',
-      });
-    });
-    return ok(banned ? 'User banned.' : 'User unbanned.');
-  };
-
-  const setUserRestricted = (userId: string, restricted: boolean): ActionResult => {
-    if (!isAdmin(user)) return fail('Admin access required.');
-    const target = db.users.find((candidate) => candidate.id === userId);
-    if (!target) return fail('User not found.');
-
-    const nowIso = new Date().toISOString();
-    setDb((prev) => {
-      const next = {
-        ...prev,
-        users: prev.users.map((candidate) =>
-          candidate.id === userId
-            ? { ...candidate, restricted, updatedAt: nowIso }
-            : candidate
-        ),
-      };
-      return addNotification(next, {
-        userId,
-        actorId: user?.id,
-        type: 'moderation',
-        text: restricted
-          ? 'Your account has writing restrictions.'
-          : 'Your writing restrictions were removed.',
-      });
-    });
-    return ok(restricted ? 'User restricted.' : 'Restriction removed.');
-  };
-
-  const setUserVerified = (userId: string, verified: boolean): ActionResult => {
-    if (!isAdmin(user)) return fail('Admin access required.');
-    const target = db.users.find((candidate) => candidate.id === userId);
-    if (!target) return fail('User not found.');
-
-    const nowIso = new Date().toISOString();
-    setDb((prev) => ({
-      ...prev,
-      users: prev.users.map((candidate) =>
-        candidate.id === userId ? { ...candidate, verified, updatedAt: nowIso } : candidate
-      ),
-    }));
-    return ok(verified ? 'Verified badge granted.' : 'Verified badge removed.');
-  };
+  const setUserRole = (_userId: string, _role: UserRole): ActionResult => fail('Admin role editor is disabled in API mode.');
+  const setUserBan = (_userId: string, _banned: boolean): ActionResult => fail('Admin moderation is disabled in API mode.');
+  const setUserRestricted = (_userId: string, _restricted: boolean): ActionResult =>
+    fail('Admin moderation is disabled in API mode.');
+  const setUserVerified = (_userId: string, _verified: boolean): ActionResult =>
+    fail('Admin moderation is disabled in API mode.');
 
   const clearNetworkData = (): ActionResult => {
-    if (!isAdmin(user)) return fail('Admin access required.');
     setDb((prev) => ({
       ...prev,
-      follows: [],
       posts: [],
       postComments: [],
       stories: [],
       storyComments: [],
       messages: [],
+      groups: [],
+      groupMembers: [],
       groupPosts: [],
       groupPostComments: [],
       notifications: [],
-      session: { ...prev.session, currentView: 'feed', activeChatUserId: null },
     }));
-    return ok('Network activity data cleared (users and groups kept).');
+    return ok('Network data cleared.');
   };
 
   const resetAllData = (): ActionResult => {
-    if (!isAdmin(user)) return fail('Admin access required.');
-    resetDb();
-    setDb(cleanDbState());
-    return ok('Database fully reset to clean state.');
+    logout();
+    return ok('Session reset.');
   };
 
   return {
@@ -1723,12 +1002,13 @@ export function useStore(): UseStore {
     groupPostComments,
     notifications,
     unreadMessagesCount,
-    isAuthenticated: Boolean(user),
-    darkMode: db.theme === 'dark',
-    currentView: db.session.currentView,
-    activeChatUserId: db.session.activeChatUserId,
-    activeGroupId: db.session.activeGroupId,
+    isAuthenticated,
+    darkMode,
+    currentView,
+    activeChatUserId,
+    activeGroupId,
     register,
+    verifyPending,
     login,
     logout,
     setTheme,

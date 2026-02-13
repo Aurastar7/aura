@@ -13,7 +13,7 @@ export const dbConfig = {
   user: process.env.PGUSER,
   password: process.env.PGPASSWORD,
   ssl: false,
-  max: toInt(process.env.PGPOOL_MAX, 20),
+  max: toInt(process.env.PGPOOL_MAX, 30),
   idleTimeoutMillis: toInt(process.env.PG_IDLE_TIMEOUT_MS, 10000),
   connectionTimeoutMillis: toInt(process.env.PG_CONNECT_TIMEOUT_MS, 2000),
   maxUses: toInt(process.env.PG_MAX_USES, 7500),

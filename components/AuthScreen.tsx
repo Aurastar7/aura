@@ -1,26 +1,77 @@
-import React, { useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import { ActionResult } from '../types';
 
 interface AuthScreenProps {
   onLogin: (username: string, password: string) => ActionResult;
-  onRegister: (displayName: string, username: string, password: string) => ActionResult;
+  onRegister: (displayName: string, username: string, email: string, password: string) => ActionResult;
+  onVerify: (code: string) => ActionResult;
   darkMode: boolean;
   onToggleTheme: () => void;
 }
 
-const AuthScreen: React.FC<AuthScreenProps> = ({ onLogin, onRegister, darkMode, onToggleTheme }) => {
-  const [mode, setMode] = useState<'login' | 'register'>('login');
+const CODE_LENGTH = 6;
+
+const AuthScreen: React.FC<AuthScreenProps> = ({
+  onLogin,
+  onRegister,
+  onVerify,
+  darkMode,
+  onToggleTheme,
+}) => {
+  const [mode, setMode] = useState<'login' | 'register' | 'verify'>('login');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
+  const [email, setEmail] = useState('');
+  const [digits, setDigits] = useState(Array.from({ length: CODE_LENGTH }, () => ''));
   const [message, setMessage] = useState<ActionResult | null>(null);
+  const digitRefs = useRef<Array<HTMLInputElement | null>>([]);
 
-  const submit = (event: React.FormEvent) => {
+  const verificationCode = useMemo(() => digits.join('').trim(), [digits]);
+
+  const submitAuth = (event: React.FormEvent) => {
     event.preventDefault();
     const result =
-      mode === 'login' ? onLogin(username, password) : onRegister(displayName, username, password);
+      mode === 'login'
+        ? onLogin(username, password)
+        : onRegister(displayName, username, email, password);
+
     setMessage(result);
-    if (result.ok) setPassword('');
+    if (!result.ok) return;
+
+    if (mode === 'register') {
+      setMode('verify');
+      setPassword('');
+      setTimeout(() => digitRefs.current[0]?.focus(), 0);
+      return;
+    }
+
+    setPassword('');
+  };
+
+  const submitVerify = (event: React.FormEvent) => {
+    event.preventDefault();
+    const result = onVerify(verificationCode);
+    setMessage(result);
+  };
+
+  const updateDigit = (index: number, value: string) => {
+    const next = value.replace(/\D/g, '').slice(-1);
+    setDigits((prev) => {
+      const copy = [...prev];
+      copy[index] = next;
+      return copy;
+    });
+
+    if (next && index < CODE_LENGTH - 1) {
+      digitRefs.current[index + 1]?.focus();
+    }
+  };
+
+  const handleKeyDown = (index: number, event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Backspace' && !digits[index] && index > 0) {
+      digitRefs.current[index - 1]?.focus();
+    }
   };
 
   return (
@@ -36,76 +87,134 @@ const AuthScreen: React.FC<AuthScreenProps> = ({ onLogin, onRegister, darkMode, 
         <p className="text-xs uppercase tracking-[0.24em] text-slate-500 dark:text-slate-300 font-semibold">Aura Social</p>
         <h1 className="mt-2 text-3xl font-black">Welcome</h1>
         <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-          Register without avatar and cover. You will set them later in profile settings.
+          Secure sign in with email verification.
         </p>
 
-        <div className="mt-6 grid grid-cols-2 gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 p-1">
-          <button
-            onClick={() => setMode('login')}
-            className={`rounded-xl px-4 py-2 text-sm font-semibold ${
-              mode === 'login'
-                ? 'bg-slate-900 text-white dark:bg-white dark:text-black'
-                : 'text-slate-500 dark:text-slate-300'
-            }`}
-          >
-            Login
-          </button>
-          <button
-            onClick={() => setMode('register')}
-            className={`rounded-xl px-4 py-2 text-sm font-semibold ${
-              mode === 'register'
-                ? 'bg-slate-900 text-white dark:bg-white dark:text-black'
-                : 'text-slate-500 dark:text-slate-300'
-            }`}
-          >
-            Register
-          </button>
-        </div>
+        {mode !== 'verify' ? (
+          <>
+            <div className="mt-6 grid grid-cols-2 gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 p-1">
+              <button
+                onClick={() => setMode('login')}
+                className={`rounded-xl px-4 py-2 text-sm font-semibold ${
+                  mode === 'login'
+                    ? 'bg-slate-900 text-white dark:bg-white dark:text-black'
+                    : 'text-slate-500 dark:text-slate-300'
+                }`}
+              >
+                Login
+              </button>
+              <button
+                onClick={() => setMode('register')}
+                className={`rounded-xl px-4 py-2 text-sm font-semibold ${
+                  mode === 'register'
+                    ? 'bg-slate-900 text-white dark:bg-white dark:text-black'
+                    : 'text-slate-500 dark:text-slate-300'
+                }`}
+              >
+                Register
+              </button>
+            </div>
 
-        <form onSubmit={submit} className="mt-6 space-y-4">
-          {mode === 'register' && (
-            <label className="block">
-              <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Display name</span>
-              <input
-                value={displayName}
-                onChange={(event) => setDisplayName(event.target.value)}
-                placeholder="Your name"
-                className="mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-black px-3 py-2 outline-none"
-                required
-              />
-            </label>
-          )}
+            <form onSubmit={submitAuth} className="mt-6 space-y-4">
+              {mode === 'register' && (
+                <label className="block">
+                  <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Display name</span>
+                  <input
+                    value={displayName}
+                    onChange={(event) => setDisplayName(event.target.value)}
+                    placeholder="Your name"
+                    className="mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-black px-3 py-2 outline-none"
+                    required
+                  />
+                </label>
+              )}
 
-          <label className="block">
-            <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Username</span>
-            <input
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
-              placeholder="username"
-              className="mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-black px-3 py-2 outline-none"
-              required
-            />
-          </label>
+              <label className="block">
+                <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Username</span>
+                <input
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  placeholder="username"
+                  className="mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-black px-3 py-2 outline-none"
+                  required
+                />
+              </label>
 
-          <label className="block">
-            <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Password</span>
-            <input
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              placeholder="password"
-              className="mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-black px-3 py-2 outline-none"
-              required
-            />
-          </label>
+              {mode === 'register' && (
+                <label className="block">
+                  <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Email</span>
+                  <input
+                    type="email"
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    placeholder="you@example.com"
+                    className="mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-black px-3 py-2 outline-none"
+                    required
+                  />
+                </label>
+              )}
 
-          <button
-            type="submit"
-            className="w-full rounded-xl py-3 bg-slate-900 text-white dark:bg-white dark:text-black font-bold"
-          >
-            {mode === 'login' ? 'Login' : 'Create account'}
-          </button>
-        </form>
+              <label className="block">
+                <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Password</span>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="password"
+                  className="mt-1 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-black px-3 py-2 outline-none"
+                  required
+                />
+              </label>
+
+              <button
+                type="submit"
+                className="w-full rounded-xl py-3 bg-slate-900 text-white dark:bg-white dark:text-black font-bold"
+              >
+                {mode === 'login' ? 'Login' : 'Create account'}
+              </button>
+            </form>
+          </>
+        ) : (
+          <form onSubmit={submitVerify} className="mt-6 space-y-4">
+            <p className="text-sm text-slate-600 dark:text-slate-300">
+              Enter the 6-digit code from your email.
+            </p>
+            <div className="flex items-center justify-between gap-2">
+              {digits.map((digit, index) => (
+                <input
+                  key={index}
+                  ref={(node) => {
+                    digitRefs.current[index] = node;
+                  }}
+                  value={digit}
+                  onChange={(event) => updateDigit(index, event.target.value)}
+                  onKeyDown={(event) => handleKeyDown(index, event)}
+                  inputMode="numeric"
+                  maxLength={1}
+                  className="w-11 h-12 text-center text-lg rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-black outline-none"
+                />
+              ))}
+            </div>
+
+            <button
+              type="submit"
+              className="w-full rounded-xl py-3 bg-slate-900 text-white dark:bg-white dark:text-black font-bold"
+            >
+              Verify
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setMode('login');
+                setDigits(Array.from({ length: CODE_LENGTH }, () => ''));
+              }}
+              className="w-full rounded-xl py-2 border border-slate-300 dark:border-slate-700"
+            >
+              Back to login
+            </button>
+          </form>
+        )}
 
         {message && (
           <p

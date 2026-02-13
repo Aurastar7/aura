@@ -40,6 +40,7 @@ const App: React.FC = () => {
     activeChatUserId,
     activeGroupId,
     register,
+    verifyPending,
     login,
     logout,
     setTheme,
@@ -403,9 +404,10 @@ const App: React.FC = () => {
           darkMode={darkMode}
           onToggleTheme={() => setTheme(darkMode ? 'light' : 'dark')}
           onLogin={(username, password) => showResult(login({ username, password }))}
-          onRegister={(displayName, username, password) =>
-            showResult(register({ displayName, username, password }))
+          onRegister={(displayName, username, email, password) =>
+            showResult(register({ displayName, username, email, password }))
           }
+          onVerify={(code) => showResult(verifyPending(code))}
         />
 
         <div className="fixed bottom-4 inset-x-0 z-[90] flex flex-col items-center gap-2 px-4 pointer-events-none">

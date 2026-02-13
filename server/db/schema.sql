@@ -21,9 +21,16 @@ CREATE TABLE IF NOT EXISTS users (
   display_name TEXT NOT NULL,
   avatar_url TEXT,
   bio TEXT NOT NULL DEFAULT '',
+  is_verified BOOLEAN NOT NULL DEFAULT false,
+  email_verification_required BOOLEAN NOT NULL DEFAULT true,
+  password_changed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_required BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS posts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -52,11 +59,10 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-CREATE INDEX IF NOT EXISTS idx_posts_user_created_at_desc ON posts(user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_sender_receiver_created_at_desc
-  ON messages(sender_id, receiver_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_receiver_sender_created_at_desc
-  ON messages(receiver_id, sender_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_user_created ON posts(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_pair_created ON messages(sender_id, receiver_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_pair_created_reverse ON messages(receiver_id, sender_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following_id);
 
 DROP TRIGGER IF EXISTS trg_users_updated_at ON users;
 DROP TRIGGER IF EXISTS trg_posts_updated_at ON posts;
