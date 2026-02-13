@@ -81,6 +81,8 @@ const App: React.FC = () => {
     setUserVerified,
     clearNetworkData,
     resetAllData,
+    exportSqlBackup,
+    importSqlBackup,
   } = useStore();
 
   const [toasts, setToasts] = useState<ToastItem[]>([]);
@@ -94,6 +96,7 @@ const App: React.FC = () => {
   const toastTimersRef = useRef<number[]>([]);
   const setCurrentViewRef = useRef(setCurrentView);
   const setActiveGroupRef = useRef(setActiveGroup);
+  const setActiveChatRef = useRef(setActiveChatUser);
 
   const usersById = useMemo(
     () => Object.fromEntries(db.users.map((candidate) => [candidate.id, candidate])),
@@ -110,7 +113,8 @@ const App: React.FC = () => {
   useEffect(() => {
     setCurrentViewRef.current = setCurrentView;
     setActiveGroupRef.current = setActiveGroup;
-  }, [setCurrentView, setActiveGroup]);
+    setActiveChatRef.current = setActiveChatUser;
+  }, [setCurrentView, setActiveGroup, setActiveChatUser]);
 
   useEffect(() => {
     usersByIdRef.current = usersById;
@@ -215,6 +219,7 @@ const App: React.FC = () => {
       const profileMatch = hash.match(/^\/u\/(.+)$/);
       const groupMatch = hash.match(/^\/g\/(.+)$/);
       const tagMatch = hash.match(/^\/tag\/(.+)$/);
+      const chatMatch = hash.match(/^\/messages\/(.+)$/);
       if (profileMatch) {
         const userId = decodeURIComponent(profileMatch[1]);
         setActiveHashtag(null);
@@ -243,6 +248,13 @@ const App: React.FC = () => {
       }
       if (hash === '/messages') {
         setActiveHashtag(null);
+        setCurrentViewRef.current('messages');
+        return;
+      }
+      if (chatMatch) {
+        const targetUserId = decodeURIComponent(chatMatch[1]);
+        setActiveHashtag(null);
+        setActiveChatRef.current(targetUserId);
         setCurrentViewRef.current('messages');
         return;
       }
@@ -295,7 +307,7 @@ const App: React.FC = () => {
     setActiveChatUser(targetUserId);
     markChatRead(targetUserId);
     setCurrentView('messages');
-    setHash('/messages');
+    setHash(`/messages/${encodeURIComponent(targetUserId)}`);
   };
 
   const openProfile = (targetUserId: string) => {
@@ -383,7 +395,9 @@ const App: React.FC = () => {
       setHash('/groups');
     } else if (view === 'messages') {
       setActiveHashtag(null);
-      setHash('/messages');
+      setHash(
+        activeChatUserId ? `/messages/${encodeURIComponent(activeChatUserId)}` : '/messages'
+      );
     } else if (view === 'notifications') {
       setActiveHashtag(null);
       setHash('/notifications');
@@ -403,11 +417,21 @@ const App: React.FC = () => {
         <AuthScreen
           darkMode={darkMode}
           onToggleTheme={() => setTheme(darkMode ? 'light' : 'dark')}
-          onLogin={(username, password) => showResult(login({ username, password }))}
-          onRegister={(displayName, username, email, password) =>
-            showResult(register({ displayName, username, email, password }))
-          }
-          onVerify={(code) => showResult(verifyPending(code))}
+          onLogin={async (username, password) => {
+            const result = await login({ username, password });
+            showResult(result);
+            return result;
+          }}
+          onRegister={async (displayName, username, email, password) => {
+            const result = await register({ displayName, username, email, password });
+            showResult(result);
+            return result;
+          }}
+          onVerify={async (code) => {
+            const result = await verifyPending(code);
+            showResult(result);
+            return result;
+          }}
         />
 
         <div className="fixed bottom-4 inset-x-0 z-[90] flex flex-col items-center gap-2 px-4 pointer-events-none">
@@ -515,7 +539,14 @@ const App: React.FC = () => {
             users={users}
             messages={messages}
             activeChatUserId={activeChatUserId}
-            onSelectChat={setActiveChatUser}
+            onSelectChat={(targetUserId) => {
+              setActiveChatUser(targetUserId);
+              setHash(
+                targetUserId
+                  ? `/messages/${encodeURIComponent(targetUserId)}`
+                  : '/messages'
+              );
+            }}
             onSendMessage={(toUserId, payload) => showResult(sendMessage(toUserId, payload))}
             onEditMessage={(messageId, text) => showResult(editMessage(messageId, text))}
             onDeleteMessage={(messageId) => showResult(deleteMessage(messageId))}
@@ -627,6 +658,14 @@ const App: React.FC = () => {
             onDeleteStory={(storyId) => showResult(deleteStory(storyId))}
             onClearNetworkData={() => showResult(clearNetworkData())}
             onResetAllData={() => showResult(resetAllData())}
+            onExportSql={async () => {
+              const result = await exportSqlBackup();
+              showResult(result);
+            }}
+            onImportSql={async (file) => {
+              const result = await importSqlBackup(file);
+              showResult(result);
+            }}
           />
         );
       default:

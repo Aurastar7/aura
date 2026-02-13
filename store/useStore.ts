@@ -75,9 +75,9 @@ type UseStore = {
   currentView: AppView;
   activeChatUserId: string | null;
   activeGroupId: string | null;
-  register: (payload: RegisterPayload) => ActionResult;
-  verifyPending: (code: string) => ActionResult;
-  login: (payload: LoginPayload) => ActionResult;
+  register: (payload: RegisterPayload) => Promise<ActionResult>;
+  verifyPending: (code: string) => Promise<ActionResult>;
+  login: (payload: LoginPayload) => Promise<ActionResult>;
   logout: () => void;
   setTheme: (theme: ThemeMode) => void;
   setCurrentView: (view: AppView) => void;
@@ -130,6 +130,8 @@ type UseStore = {
   setUserVerified: (userId: string, verified: boolean) => ActionResult;
   clearNetworkData: () => ActionResult;
   resetAllData: () => ActionResult;
+  exportSqlBackup: () => Promise<ActionResult>;
+  importSqlBackup: (file: File) => Promise<ActionResult>;
 };
 
 const ok = (message: string): ActionResult => ({ ok: true, message });
@@ -140,6 +142,10 @@ const toUser = (raw: any): User => {
   const updatedAt = raw?.updatedAt || raw?.updated_at || createdAt;
   const displayName = raw?.displayName || raw?.display_name || raw?.username || 'User';
   const avatar = raw?.avatarUrl || raw?.avatar_url || '';
+  const rawRole = String(raw?.role || 'user');
+  const role: UserRole = ['user', 'moderator', 'curator', 'admin'].includes(rawRole)
+    ? (rawRole as UserRole)
+    : 'user';
 
   return {
     id: String(raw?.id || ''),
@@ -150,7 +156,7 @@ const toUser = (raw: any): User => {
     status: String(raw?.status || ''),
     avatar,
     coverImage: String(raw?.coverImage || ''),
-    role: raw?.role === 'admin' ? 'admin' : 'user',
+    role,
     banned: Boolean(raw?.banned),
     restricted: Boolean(raw?.restricted),
     verified: Boolean(raw?.isVerified || raw?.verified),
@@ -179,6 +185,13 @@ const toMessage = (raw: any, me: string): Message => {
   const senderId = String(raw?.senderId || raw?.fromId || '');
   const receiverId = String(raw?.receiverId || raw?.toId || '');
   const createdAt = String(raw?.createdAt || nowIso());
+  const readBy = [senderId];
+  if (raw?.readAt) {
+    readBy.push(receiverId);
+  } else if (senderId === me) {
+    readBy.push(me);
+  }
+
   return {
     id: String(raw?.id || ''),
     fromId: senderId,
@@ -188,7 +201,7 @@ const toMessage = (raw: any, me: string): Message => {
     mediaUrl: raw?.mediaUrl,
     expiresAt: raw?.expiresAt,
     editedAt: raw?.editedAt,
-    readBy: receiverId === me ? [] : [me],
+    readBy: Array.from(new Set(readBy.filter(Boolean))),
     createdAt,
   };
 };
@@ -244,7 +257,7 @@ export function useStore(): UseStore {
   );
 
   const messages = useMemo(
-    () => [...db.messages].sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt)),
+    () => [...db.messages].sort((a, b) => +new Date(a.createdAt) - +new Date(b.createdAt)),
     [db.messages]
   );
 
@@ -289,10 +302,11 @@ export function useStore(): UseStore {
   const mergeUsers = useCallback((incoming: User[]) => {
     if (!incoming.length) return;
     setDb((prev) => {
-      const map = new Map(prev.users.map((item) => [item.id, item]));
+      const map = new Map<string, User>(prev.users.map((item) => [item.id, item]));
       incoming.forEach((item) => {
         if (!item.id) return;
-        map.set(item.id, { ...(map.get(item.id) || item), ...item });
+        const current = map.get(item.id);
+        map.set(item.id, current ? { ...current, ...item } : item);
       });
       return { ...prev, users: Array.from(map.values()) };
     });
@@ -412,7 +426,7 @@ export function useStore(): UseStore {
         const message = toMessage(payload.message, me);
         setDb((prev) => {
           if (prev.messages.some((item) => item.id === message.id)) return prev;
-          return { ...prev, messages: [message, ...prev.messages] };
+          return { ...prev, messages: [...prev.messages, message] };
         });
       } catch {
         // ignore malformed ws payload
@@ -476,7 +490,7 @@ export function useStore(): UseStore {
     void fetchMessagesWith(activeChatUserId);
   }, [activeChatUserId, fetchMessagesWith]);
 
-  const register = (payload: RegisterPayload): ActionResult => {
+  const register = async (payload: RegisterPayload): Promise<ActionResult> => {
     const username = String(payload.username || '').trim().toLowerCase();
     const displayName = String(payload.displayName || username).trim();
     const email = String(payload.email || `${username}@aura.local`).trim().toLowerCase();
@@ -484,110 +498,110 @@ export function useStore(): UseStore {
 
     if (!username || !password) return fail('Username and password are required.');
 
-    void (async () => {
-      try {
-        const data = await apiRequest(
-          '/api/auth/register',
-          {
-            method: 'POST',
-            body: JSON.stringify({ username, displayName, email, password }),
-          },
-          false
-        );
+    try {
+      const data = await apiRequest(
+        '/api/auth/register',
+        {
+          method: 'POST',
+          body: JSON.stringify({ username, displayName, email, password }),
+        },
+        false
+      );
 
-        if (data.requiresVerification && data.userId) {
-          setPendingVerificationUserId(String(data.userId));
-          return;
-        }
-
-        if (data.token && data.user) {
-          const mapped = toUser(data.user);
-          setToken(String(data.token));
-          setDb((prev) => ({
-            ...prev,
-            users: [mapped, ...prev.users.filter((item) => item.id !== mapped.id)],
-            session: { ...prev.session, userId: mapped.id },
-          }));
-        }
-      } catch {
-        // handled by immediate return path
+      if (data.requiresVerification && data.userId) {
+        setPendingVerificationUserId(String(data.userId));
+        return ok('Account created. Enter the code from your email.');
       }
-    })();
 
-    return ok('Account created. Enter the code from your email.');
+      if (data.token && data.user) {
+        const mapped = toUser(data.user);
+        setToken(String(data.token));
+        setDb((prev) => ({
+          ...prev,
+          users: [mapped, ...prev.users.filter((item) => item.id !== mapped.id)],
+          session: { ...prev.session, userId: mapped.id },
+        }));
+        await fetchFeed();
+        await fetchUsers();
+        await fetchFollows();
+        return ok('Account created and signed in.');
+      }
+
+      return fail('Registration completed, but response is incomplete.');
+    } catch (error: any) {
+      return fail(String(error?.message || 'Registration failed.'));
+    }
   };
 
-  const verifyPending = (code: string): ActionResult => {
+  const verifyPending = async (code: string): Promise<ActionResult> => {
     const trimmed = String(code || '').trim();
     if (!pendingVerificationUserId) return fail('No pending verification.');
     if (trimmed.length < 4) return fail('Enter verification code.');
 
-    void (async () => {
-      try {
-        const data = await apiRequest(
-          '/api/auth/verify',
-          {
-            method: 'POST',
-            body: JSON.stringify({ userId: pendingVerificationUserId, code: trimmed }),
-          },
-          false
-        );
+    try {
+      const data = await apiRequest(
+        '/api/auth/verify',
+        {
+          method: 'POST',
+          body: JSON.stringify({ userId: pendingVerificationUserId, code: trimmed }),
+        },
+        false
+      );
 
-        if (data.token && data.user) {
-          const mapped = toUser(data.user);
-          setToken(String(data.token));
-          setPendingVerificationUserId('');
-          setDb((prev) => ({
-            ...prev,
-            users: [mapped, ...prev.users.filter((item) => item.id !== mapped.id)],
-            session: { ...prev.session, userId: mapped.id },
-          }));
-          await fetchFeed();
-          await fetchUsers();
-          await fetchFollows();
-        }
-      } catch {
-        // handled by return value
+      if (data.token && data.user) {
+        const mapped = toUser(data.user);
+        setToken(String(data.token));
+        setPendingVerificationUserId('');
+        setDb((prev) => ({
+          ...prev,
+          users: [mapped, ...prev.users.filter((item) => item.id !== mapped.id)],
+          session: { ...prev.session, userId: mapped.id },
+        }));
+        await fetchFeed();
+        await fetchUsers();
+        await fetchFollows();
+        return ok('Email verified.');
       }
-    })();
 
-    return ok('Verification submitted.');
+      return fail('Verification response is invalid.');
+    } catch (error: any) {
+      return fail(String(error?.message || 'Verification failed.'));
+    }
   };
 
-  const login = (payload: LoginPayload): ActionResult => {
+  const login = async (payload: LoginPayload): Promise<ActionResult> => {
     const username = String(payload.username || '').trim().toLowerCase();
     const password = String(payload.password || '');
     if (!username || !password) return fail('Missing credentials.');
 
-    void (async () => {
-      try {
-        const data = await apiRequest(
-          '/api/auth/login',
-          {
-            method: 'POST',
-            body: JSON.stringify({ username, password }),
-          },
-          false
-        );
+    try {
+      const data = await apiRequest(
+        '/api/auth/login',
+        {
+          method: 'POST',
+          body: JSON.stringify({ username, password }),
+        },
+        false
+      );
 
-        if (data.token && data.user) {
-          const mapped = toUser(data.user);
-          setToken(String(data.token));
-          setDb((prev) => ({
-            ...prev,
-            users: [mapped, ...prev.users.filter((item) => item.id !== mapped.id)],
-            session: { ...prev.session, userId: mapped.id },
-          }));
-          await fetchFeed();
-          await fetchUsers();
-          await fetchFollows();
-        }
-      } catch {
-        // handled by immediate status message
+      if (data.token && data.user) {
+        const mapped = toUser(data.user);
+        setToken(String(data.token));
+        setDb((prev) => ({
+          ...prev,
+          users: [mapped, ...prev.users.filter((item) => item.id !== mapped.id)],
+          session: { ...prev.session, userId: mapped.id },
+        }));
+        await fetchFeed();
+        await fetchUsers();
+        await fetchFollows();
+        return ok('Login successful.');
       }
-    })();
 
-    return ok('Login requested.');
+      return fail('Login response is invalid.');
+    } catch (error: any) {
+      return fail(String(error?.message || 'Login failed.'));
+    }
   };
 
   const logout = () => {
@@ -653,6 +667,7 @@ export function useStore(): UseStore {
   const deletePost = (postId: string): ActionResult => {
     const existing = db.posts.find((item) => item.id === postId);
     if (!existing) return fail('Post not found.');
+    if (!user) return fail('Unauthorized.');
 
     setDb((prev) => ({
       ...prev,
@@ -660,7 +675,10 @@ export function useStore(): UseStore {
       postComments: prev.postComments.filter((item) => item.postId !== postId),
     }));
 
-    void apiRequest(`/api/posts/${postId}`, { method: 'DELETE' }, true).catch(() => {
+    const canAdminDelete = user.role === 'admin' && existing.authorId !== user.id;
+    const endpoint = canAdminDelete ? `/api/admin/posts/${postId}` : `/api/posts/${postId}`;
+
+    void apiRequest(endpoint, { method: 'DELETE' }, true).catch(() => {
       setDb((prev) => ({ ...prev, posts: [existing, ...prev.posts] }));
     });
 
@@ -826,7 +844,7 @@ export function useStore(): UseStore {
       readBy: [user.id],
     };
 
-    setDb((prev) => ({ ...prev, messages: [optimistic, ...prev.messages] }));
+    setDb((prev) => ({ ...prev, messages: [...prev.messages, optimistic] }));
 
     void (async () => {
       try {
@@ -843,7 +861,7 @@ export function useStore(): UseStore {
         const persisted = toMessage(data.message, user.id);
         setDb((prev) => ({
           ...prev,
-          messages: [persisted, ...prev.messages.filter((item) => item.id !== optimistic.id)],
+          messages: [...prev.messages.filter((item) => item.id !== optimistic.id), persisted],
         }));
       } catch {
         setDb((prev) => ({ ...prev, messages: prev.messages.filter((item) => item.id !== optimistic.id) }));
@@ -958,12 +976,143 @@ export function useStore(): UseStore {
   const toggleGroupPostCommentLike = (_commentId: string): ActionResult =>
     fail('Groups are disabled in API mode.');
 
-  const setUserRole = (_userId: string, _role: UserRole): ActionResult => fail('Admin role editor is disabled in API mode.');
-  const setUserBan = (_userId: string, _banned: boolean): ActionResult => fail('Admin moderation is disabled in API mode.');
-  const setUserRestricted = (_userId: string, _restricted: boolean): ActionResult =>
-    fail('Admin moderation is disabled in API mode.');
-  const setUserVerified = (_userId: string, _verified: boolean): ActionResult =>
-    fail('Admin moderation is disabled in API mode.');
+  const patchAdminUser = (
+    targetUserId: string,
+    patch: Record<string, unknown>,
+    successMessage: string
+  ): ActionResult => {
+    if (!user || user.role !== 'admin') return fail('Admin access required.');
+    const existing = db.users.find((candidate) => candidate.id === targetUserId);
+    if (!existing) return fail('User not found.');
+
+    const optimistic = toUser({
+      ...existing,
+      ...patch,
+      isVerified: patch.isVerified ?? existing.verified,
+      updatedAt: nowIso(),
+    });
+
+    setDb((prev) => ({
+      ...prev,
+      users: prev.users.map((candidate) => (candidate.id === targetUserId ? optimistic : candidate)),
+    }));
+
+    void apiRequest(
+      `/api/admin/users/${targetUserId}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(patch),
+      },
+      true
+    )
+      .then((payload) => {
+        if (!payload?.user) return;
+        const persisted = toUser(payload.user);
+        setDb((prev) => ({
+          ...prev,
+          users: prev.users.map((candidate) => (candidate.id === targetUserId ? persisted : candidate)),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          users: prev.users.map((candidate) => (candidate.id === targetUserId ? existing : candidate)),
+        }));
+      });
+
+    return ok(successMessage);
+  };
+
+  const setUserRole = (targetUserId: string, role: UserRole): ActionResult =>
+    patchAdminUser(targetUserId, { role }, 'Role updated.');
+  const setUserBan = (targetUserId: string, banned: boolean): ActionResult =>
+    patchAdminUser(targetUserId, { banned }, banned ? 'User banned.' : 'User unbanned.');
+  const setUserRestricted = (targetUserId: string, restricted: boolean): ActionResult =>
+    patchAdminUser(
+      targetUserId,
+      { restricted },
+      restricted ? 'User restricted.' : 'User restriction removed.'
+    );
+  const setUserVerified = (targetUserId: string, verified: boolean): ActionResult =>
+    patchAdminUser(
+      targetUserId,
+      { isVerified: verified },
+      verified ? 'User verified.' : 'User verification removed.'
+    );
+
+  const exportSqlBackup = async (): Promise<ActionResult> => {
+    if (!token || !user || user.role !== 'admin') return fail('Admin access required.');
+    try {
+      const response = await fetch(apiUrl('/api/admin/sql/export'), {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        return fail(String(payload?.message || `Export failed (${response.status}).`));
+      }
+
+      const blob = await response.blob();
+      const disposition = response.headers.get('content-disposition') || '';
+      const match = disposition.match(/filename="?([^"]+)"?/i);
+      const fallbackName = `aura-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.sql`;
+      const filename = match?.[1] || fallbackName;
+
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(objectUrl);
+
+      return ok('SQL backup downloaded.');
+    } catch (error: any) {
+      return fail(String(error?.message || 'Failed to export SQL backup.'));
+    }
+  };
+
+  const importSqlBackup = async (file: File): Promise<ActionResult> => {
+    if (!token || !user || user.role !== 'admin') return fail('Admin access required.');
+    if (!file) return fail('SQL file is required.');
+
+    try {
+      const sql = await file.text();
+      if (!sql.trim()) return fail('SQL file is empty.');
+
+      const response = await fetch(apiUrl('/api/admin/sql/import'), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/sql',
+        },
+        body: sql,
+      });
+
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        return fail(String(payload?.message || `Import failed (${response.status}).`));
+      }
+
+      await hydrateMe();
+      await fetchFeed();
+      await fetchUsers();
+      await fetchFollows();
+      if (activeChatUserId) {
+        await fetchMessagesWith(activeChatUserId);
+      } else {
+        setDb((prev) => ({ ...prev, messages: [] }));
+      }
+
+      return ok(String(payload?.message || 'SQL import completed.'));
+    } catch (error: any) {
+      return fail(String(error?.message || 'Failed to import SQL backup.'));
+    }
+  };
 
   const clearNetworkData = (): ActionResult => {
     setDb((prev) => ({
@@ -1054,5 +1203,7 @@ export function useStore(): UseStore {
     setUserVerified,
     clearNetworkData,
     resetAllData,
+    exportSqlBackup,
+    importSqlBackup,
   };
 }

@@ -115,7 +115,7 @@ const Messages: React.FC<MessagesProps> = ({
           (message.fromId === currentUser.id && message.toId === activeChatUser.id) ||
           (message.fromId === activeChatUser.id && message.toId === currentUser.id)
       )
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
   }, [messages, currentUser.id, activeChatUser]);
 
   useEffect(() => {
@@ -128,7 +128,7 @@ const Messages: React.FC<MessagesProps> = ({
     const container = conversationRef.current;
     if (!container) return;
     requestAnimationFrame(() => {
-      container.scrollTop = 0;
+      container.scrollTop = container.scrollHeight;
     });
   }, [activeChatUserId, conversation.length]);
 

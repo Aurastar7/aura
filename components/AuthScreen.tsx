@@ -2,9 +2,14 @@ import React, { useMemo, useRef, useState } from 'react';
 import { ActionResult } from '../types';
 
 interface AuthScreenProps {
-  onLogin: (username: string, password: string) => ActionResult;
-  onRegister: (displayName: string, username: string, email: string, password: string) => ActionResult;
-  onVerify: (code: string) => ActionResult;
+  onLogin: (username: string, password: string) => Promise<ActionResult> | ActionResult;
+  onRegister: (
+    displayName: string,
+    username: string,
+    email: string,
+    password: string
+  ) => Promise<ActionResult> | ActionResult;
+  onVerify: (code: string) => Promise<ActionResult> | ActionResult;
   darkMode: boolean;
   onToggleTheme: () => void;
 }
@@ -25,16 +30,20 @@ const AuthScreen: React.FC<AuthScreenProps> = ({
   const [email, setEmail] = useState('');
   const [digits, setDigits] = useState(Array.from({ length: CODE_LENGTH }, () => ''));
   const [message, setMessage] = useState<ActionResult | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const digitRefs = useRef<Array<HTMLInputElement | null>>([]);
 
   const verificationCode = useMemo(() => digits.join('').trim(), [digits]);
 
-  const submitAuth = (event: React.FormEvent) => {
+  const submitAuth = async (event: React.FormEvent) => {
     event.preventDefault();
-    const result =
+    setSubmitting(true);
+    const result = await Promise.resolve(
       mode === 'login'
         ? onLogin(username, password)
-        : onRegister(displayName, username, email, password);
+        : onRegister(displayName, username, email, password)
+    );
+    setSubmitting(false);
 
     setMessage(result);
     if (!result.ok) return;
@@ -49,9 +58,11 @@ const AuthScreen: React.FC<AuthScreenProps> = ({
     setPassword('');
   };
 
-  const submitVerify = (event: React.FormEvent) => {
+  const submitVerify = async (event: React.FormEvent) => {
     event.preventDefault();
-    const result = onVerify(verificationCode);
+    setSubmitting(true);
+    const result = await Promise.resolve(onVerify(verificationCode));
+    setSubmitting(false);
     setMessage(result);
   };
 
@@ -168,9 +179,10 @@ const AuthScreen: React.FC<AuthScreenProps> = ({
 
               <button
                 type="submit"
+                disabled={submitting}
                 className="w-full rounded-xl py-3 bg-slate-900 text-white dark:bg-white dark:text-black font-bold"
               >
-                {mode === 'login' ? 'Login' : 'Create account'}
+                {submitting ? 'Please wait...' : mode === 'login' ? 'Login' : 'Create account'}
               </button>
             </form>
           </>
@@ -198,9 +210,10 @@ const AuthScreen: React.FC<AuthScreenProps> = ({
 
             <button
               type="submit"
+              disabled={submitting}
               className="w-full rounded-xl py-3 bg-slate-900 text-white dark:bg-white dark:text-black font-bold"
             >
-              Verify
+              {submitting ? 'Please wait...' : 'Verify'}
             </button>
 
             <button

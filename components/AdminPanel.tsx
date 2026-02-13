@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { NotificationItem, Post, Story, User, UserRole } from '../types';
 
 interface AdminPanelProps {
@@ -15,6 +15,8 @@ interface AdminPanelProps {
   onDeleteStory: (storyId: string) => void;
   onClearNetworkData: () => void;
   onResetAllData: () => void;
+  onExportSql: () => Promise<void>;
+  onImportSql: (file: File) => Promise<void>;
 }
 
 const roles: UserRole[] = ['user', 'moderator', 'curator', 'admin'];
@@ -33,8 +35,32 @@ const AdminPanel: React.FC<AdminPanelProps> = ({
   onDeleteStory,
   onClearNetworkData,
   onResetAllData,
+  onExportSql,
+  onImportSql,
 }) => {
+  const [sqlBusy, setSqlBusy] = useState(false);
   const nonAdminUsers = users.filter((user) => user.id !== currentAdmin.id);
+
+  const handleSqlExport = async () => {
+    setSqlBusy(true);
+    try {
+      await onExportSql();
+    } finally {
+      setSqlBusy(false);
+    }
+  };
+
+  const handleSqlImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setSqlBusy(true);
+    try {
+      await onImportSql(file);
+    } finally {
+      setSqlBusy(false);
+    }
+  };
 
   return (
     <div className="pb-24 lg:pb-6">
@@ -75,6 +101,23 @@ const AdminPanel: React.FC<AdminPanelProps> = ({
         >
           Reset database
         </button>
+        <button
+          onClick={handleSqlExport}
+          disabled={sqlBusy}
+          className="rounded-xl px-3 py-2 text-sm font-semibold border border-slate-300 dark:border-slate-700 bg-white dark:bg-black disabled:opacity-60"
+        >
+          {sqlBusy ? 'Preparing SQL...' : 'Download SQL backup'}
+        </button>
+        <label className="rounded-xl px-3 py-2 text-sm font-semibold border border-slate-300 dark:border-slate-700 bg-white dark:bg-black cursor-pointer disabled:opacity-60">
+          Upload SQL backup
+          <input
+            type="file"
+            accept=".sql,text/plain,application/sql"
+            className="hidden"
+            onChange={handleSqlImport}
+            disabled={sqlBusy}
+          />
+        </label>
       </section>
 
       <section className="px-6 py-4">

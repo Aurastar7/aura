@@ -1,4 +1,6 @@
 import { createServer } from 'node:http';
+import { promises as fs } from 'node:fs';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
@@ -28,6 +30,13 @@ const jwtSecret = process.env.JWT_SECRET || '';
 const nodeEnv = process.env.NODE_ENV || 'development';
 const verificationRequired = String(process.env.EMAIL_VERIFICATION_REQUIRED || 'true') !== 'false';
 const mailFrom = process.env.MAIL_FROM || 'Aura Social <no-reply@aura.local>';
+const adminEmails = new Set(
+  String(process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean)
+);
+const ADMIN_ROLES = new Set(['user', 'moderator', 'curator', 'admin']);
 
 const toInt = (value, fallback) => {
   const parsed = Number(value);
@@ -75,6 +84,9 @@ const sendJsonError = (res, status, message, details) => {
 const isEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 const isUsername = (value) => /^[a-zA-Z0-9_.-]{3,32}$/.test(value);
 const sanitize = (value) => String(value ?? '').trim();
+const isAdminUser = (user) =>
+  Boolean(user && (user.role === 'admin' || adminEmails.has(String(user.email || '').toLowerCase())));
+const sortUuidPair = (left, right) => (left <= right ? [left, right] : [right, left]);
 
 const signToken = (userId) => {
   if (!jwtSecret) throw new HttpError(500, 'JWT secret is not configured.');
@@ -109,6 +121,9 @@ const loadUserById = async (userId) => {
         display_name AS "displayName",
         avatar_url AS "avatarUrl",
         bio,
+        role,
+        banned,
+        restricted,
         is_verified AS "isVerified",
         email_verification_required AS "emailVerificationRequired",
         created_at AS "createdAt",
@@ -127,9 +142,18 @@ const requireAuth = asyncRoute(async (req, _res, next) => {
   if (!userId) throw new HttpError(401, 'Unauthorized.');
   const user = await loadUserById(userId);
   if (!user) throw new HttpError(401, 'User not found.');
+  if (user.banned) throw new HttpError(403, 'Account is banned.');
   req.user = user;
   next();
 });
+
+const requireAdmin = (req, _res, next) => {
+  if (!isAdminUser(req.user)) {
+    next(new HttpError(403, 'Admin access required.'));
+    return;
+  }
+  next();
+};
 
 const sixDigitCode = () => String(Math.floor(100000 + Math.random() * 900000));
 
@@ -171,6 +195,186 @@ const withTransaction = async (work) => {
   } finally {
     client.release();
   }
+};
+
+const quoteIdentifier = (value) => `"${String(value).replace(/"/g, '""')}"`;
+
+const toSqlLiteral = (value) => {
+  if (value === null || value === undefined) return 'NULL';
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : 'NULL';
+  if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
+  if (value instanceof Date) return `'${value.toISOString().replace(/'/g, "''")}'`;
+  if (Buffer.isBuffer(value)) return `decode('${value.toString('hex')}', 'hex')`;
+  if (Array.isArray(value)) return `ARRAY[${value.map((item) => toSqlLiteral(item)).join(', ')}]`;
+  if (typeof value === 'object') return `'${JSON.stringify(value).replace(/'/g, "''")}'::jsonb`;
+  return `'${String(value).replace(/'/g, "''")}'`;
+};
+
+const tablePriority = (tableName) => {
+  const map = new Map([
+    ['users', 10],
+    ['dialogs', 20],
+    ['dialog_members', 30],
+    ['follows', 40],
+    ['posts', 50],
+    ['messages', 60],
+  ]);
+  return map.get(tableName) ?? 1000;
+};
+
+const createFallbackSqlDump = async () => {
+  const schemaPath = path.resolve(rootDir, 'server', 'db', 'schema.sql');
+  const schemaSql = await fs.readFile(schemaPath, 'utf8');
+  const { rows: tables } = await pool.query(
+    `
+      SELECT tablename
+      FROM pg_tables
+      WHERE schemaname = 'public'
+    `
+  );
+
+  const orderedTables = tables
+    .map((item) => item.tablename)
+    .sort((left, right) => {
+      const byPriority = tablePriority(left) - tablePriority(right);
+      if (byPriority !== 0) return byPriority;
+      return left.localeCompare(right);
+    });
+
+  const lines = [];
+  lines.push('-- Aura Social SQL export');
+  lines.push(`-- Generated at ${new Date().toISOString()}`);
+  lines.push('');
+  lines.push(schemaSql.trim());
+  lines.push('');
+  lines.push('BEGIN;');
+
+  if (orderedTables.length) {
+    lines.push(
+      `TRUNCATE TABLE ${orderedTables.map((tableName) => quoteIdentifier(tableName)).join(', ')} RESTART IDENTITY CASCADE;`
+    );
+  }
+
+  for (const tableName of orderedTables) {
+    const { rows: columnRows } = await pool.query(
+      `
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = $1
+        ORDER BY ordinal_position
+      `,
+      [tableName]
+    );
+
+    const columns = columnRows.map((item) => item.column_name);
+    if (!columns.length) continue;
+
+    const selectColumns = columns.map((column) => quoteIdentifier(column)).join(', ');
+    const { rows } = await pool.query(`SELECT ${selectColumns} FROM ${quoteIdentifier(tableName)}`);
+    if (!rows.length) continue;
+
+    lines.push('');
+    lines.push(`-- Data for ${tableName}`);
+    const chunkSize = 250;
+    for (let index = 0; index < rows.length; index += chunkSize) {
+      const chunk = rows.slice(index, index + chunkSize);
+      const tuples = chunk.map((row) => {
+        const values = columns.map((column) => toSqlLiteral(row[column]));
+        return `(${values.join(', ')})`;
+      });
+      lines.push(
+        `INSERT INTO ${quoteIdentifier(tableName)} (${columns
+          .map((column) => quoteIdentifier(column))
+          .join(', ')}) VALUES\n${tuples.join(',\n')};`
+      );
+    }
+  }
+
+  lines.push('');
+  lines.push('COMMIT;');
+  lines.push('');
+
+  return lines.join('\n');
+};
+
+const runPgDump = async () =>
+  new Promise((resolve, reject) => {
+    const args = ['--inserts', '--no-owner', '--no-privileges', '--encoding=UTF8'];
+    const env = { ...process.env };
+
+    if (process.env.DATABASE_URL) {
+      args.push(process.env.DATABASE_URL);
+    } else {
+      if (process.env.PGHOST) args.push('-h', process.env.PGHOST);
+      if (process.env.PGPORT) args.push('-p', process.env.PGPORT);
+      if (process.env.PGUSER) args.push('-U', process.env.PGUSER);
+      if (process.env.PGDATABASE) {
+        args.push(process.env.PGDATABASE);
+      } else {
+        reject(new Error('PGDATABASE is not configured.'));
+        return;
+      }
+      if (process.env.PGPASSWORD) {
+        env.PGPASSWORD = process.env.PGPASSWORD;
+      }
+    }
+
+    const child = spawn('pg_dump', args, { env });
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on('error', (error) => {
+      reject(error);
+    });
+    child.on('close', (code) => {
+      if (code === 0 && stdout.trim()) {
+        resolve(stdout);
+        return;
+      }
+      reject(new Error(stderr.trim() || `pg_dump exited with code ${code}`));
+    });
+  });
+
+const createSqlDump = async () => {
+  try {
+    return await runPgDump();
+  } catch {
+    return createFallbackSqlDump();
+  }
+};
+
+const ensureDirectDialog = async (client, leftUserId, rightUserId) => {
+  const [userA, userB] = sortUuidPair(leftUserId, rightUserId);
+  const { rows } = await client.query(
+    `
+      INSERT INTO dialogs (kind, direct_user_a, direct_user_b)
+      VALUES ('direct', $1, $2)
+      ON CONFLICT (direct_user_a, direct_user_b)
+      DO UPDATE SET updated_at = NOW()
+      RETURNING id
+    `,
+    [userA, userB]
+  );
+
+  const dialogId = rows[0]?.id;
+  if (!dialogId) throw new HttpError(500, 'Failed to resolve dialog.');
+
+  await client.query(
+    `
+      INSERT INTO dialog_members (dialog_id, user_id)
+      VALUES ($1, $2), ($1, $3)
+      ON CONFLICT (dialog_id, user_id) DO NOTHING
+    `,
+    [dialogId, leftUserId, rightUserId]
+  );
+
+  return dialogId;
 };
 
 const cacheFeedKey = (userId, page, limit) => `feed:${userId}:${page}:${limit}`;
@@ -223,10 +427,39 @@ const mapPostRow = (row) => ({
 
 const mapMessageRow = (row) => ({
   id: row.id,
+  dialogId: row.dialogId,
   senderId: row.senderId,
   receiverId: row.receiverId,
   content: row.content,
+  readAt: row.readAt,
+  editedAt: row.editedAt,
   createdAt: row.createdAt,
+});
+
+const mapDialogRow = (row) => ({
+  id: row.id,
+  kind: row.kind,
+  createdAt: row.createdAt,
+  updatedAt: row.updatedAt,
+  unreadCount: row.unreadCount,
+  peer: row.peerId
+    ? {
+        id: row.peerId,
+        username: row.peerUsername,
+        displayName: row.peerDisplayName,
+        avatarUrl: row.peerAvatarUrl,
+        isVerified: row.peerIsVerified,
+      }
+    : null,
+  lastMessage: row.lastMessageId
+    ? {
+        id: row.lastMessageId,
+        senderId: row.lastMessageSenderId,
+        receiverId: row.lastMessageReceiverId,
+        content: row.lastMessageContent,
+        createdAt: row.lastMessageCreatedAt,
+      }
+    : null,
 });
 
 const wsAuthBySocket = new WeakMap();
@@ -273,6 +506,13 @@ app.use(
 );
 
 app.use(express.json({ limit: '2mb' }));
+app.use(
+  '/api/admin/sql/import',
+  express.text({
+    type: ['application/sql', 'text/plain', 'application/octet-stream'],
+    limit: '75mb',
+  })
+);
 
 const limiterStore = new RedisStore({
   sendCommand: (...args) => redis.sendCommand(args),
@@ -321,6 +561,10 @@ app.post(
 
     const user = await withTransaction(async (client) => {
       try {
+        const { rows: countRows } = await client.query('SELECT COUNT(*)::INT AS total FROM users');
+        const isFirstUser = (countRows[0]?.total || 0) === 0;
+        const role = isFirstUser || adminEmails.has(email) ? 'admin' : 'user';
+
         const inserted = await client.query(
           `
             INSERT INTO users (
@@ -328,13 +572,22 @@ app.post(
               email,
               password_hash,
               display_name,
+              role,
               is_verified,
               email_verification_required
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id, email
           `,
-          [username, email, passwordHash, displayName || username, !verificationRequired, verificationRequired]
+          [
+            username,
+            email,
+            passwordHash,
+            displayName || username,
+            role,
+            !verificationRequired,
+            verificationRequired,
+          ]
         );
         return inserted.rows[0];
       } catch (error) {
@@ -408,7 +661,8 @@ app.post(
           username,
           email,
           password_hash AS "passwordHash",
-          is_verified AS "isVerified"
+          is_verified AS "isVerified",
+          banned
         FROM users
         WHERE username = $1 OR email = $1
         LIMIT 1
@@ -418,6 +672,7 @@ app.post(
 
     const user = rows[0];
     if (!user) throw new HttpError(401, 'Invalid credentials.');
+    if (user.banned) throw new HttpError(403, 'Account is banned.');
 
     const isValid = await bcrypt.compare(password, user.passwordHash);
     if (!isValid) throw new HttpError(401, 'Invalid credentials.');
@@ -447,6 +702,9 @@ app.get(
           u.display_name AS "displayName",
           u.avatar_url AS "avatarUrl",
           u.bio,
+          u.role,
+          u.banned,
+          u.restricted,
           u.is_verified AS "isVerified",
           u.created_at AS "createdAt",
           COALESCE(followers.count, 0) AS "followersCount",
@@ -493,6 +751,9 @@ app.get(
             display_name AS "displayName",
             avatar_url AS "avatarUrl",
             bio,
+            role,
+            banned,
+            restricted,
             is_verified AS "isVerified",
             created_at AS "createdAt",
             updated_at AS "updatedAt"
@@ -515,6 +776,9 @@ app.get(
           display_name AS "displayName",
           avatar_url AS "avatarUrl",
           bio,
+          role,
+          banned,
+          restricted,
           is_verified AS "isVerified",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
@@ -574,6 +838,9 @@ app.put(
           display_name AS "displayName",
           avatar_url AS "avatarUrl",
           bio,
+          role,
+          banned,
+          restricted,
           is_verified AS "isVerified",
           email_verification_required AS "emailVerificationRequired",
           created_at AS "createdAt",
@@ -730,6 +997,7 @@ app.post(
   requireAuth,
   asyncRoute(async (req, res) => {
     const actor = req.user;
+    if (actor.restricted) throw new HttpError(403, 'Account is restricted.');
     const content = String(req.body.content || '').trim();
     if (!content) throw new HttpError(400, 'Post content is required.');
 
@@ -926,29 +1194,37 @@ app.post(
   requireAuth,
   asyncRoute(async (req, res) => {
     const actor = req.user;
+    if (actor.restricted) throw new HttpError(403, 'Account is restricted.');
     const receiverId = sanitize(req.body.receiverId);
     const content = String(req.body.content || req.body.text || '').trim();
 
     if (!receiverId) throw new HttpError(400, 'receiverId is required.');
+    if (!isUUID(receiverId)) throw new HttpError(400, 'receiverId must be a UUID.');
     if (!content) throw new HttpError(400, 'content is required.');
     if (receiverId === actor.id) throw new HttpError(400, 'Cannot send message to yourself.');
 
     const message = await withTransaction(async (client) => {
-      const receiver = await client.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [receiverId]);
+      const receiver = await client.query('SELECT id, banned FROM users WHERE id = $1 LIMIT 1', [receiverId]);
       if (!receiver.rows[0]) throw new HttpError(404, 'Receiver not found.');
+      if (receiver.rows[0].banned) throw new HttpError(403, 'Receiver account is unavailable.');
+
+      const dialogId = await ensureDirectDialog(client, actor.id, receiverId);
 
       const inserted = await client.query(
         `
-          INSERT INTO messages (sender_id, receiver_id, content)
-          VALUES ($1, $2, $3)
+          INSERT INTO messages (dialog_id, sender_id, receiver_id, content)
+          VALUES ($1, $2, $3, $4)
           RETURNING
             id,
+            dialog_id AS "dialogId",
             sender_id AS "senderId",
             receiver_id AS "receiverId",
             content,
+            read_at AS "readAt",
+            edited_at AS "editedAt",
             created_at AS "createdAt"
         `,
-        [actor.id, receiverId, content]
+        [dialogId, actor.id, receiverId, content]
       );
 
       return mapMessageRow(inserted.rows[0]);
@@ -965,28 +1241,304 @@ app.get(
   asyncRoute(async (req, res) => {
     const actor = req.user;
     const otherUserId = req.params.userId;
+    if (!isUUID(otherUserId)) throw new HttpError(400, 'Invalid user id.');
     const { limit, offset, page } = parsePagination(req);
+
+    const [userA, userB] = sortUuidPair(actor.id, otherUserId);
+    const { rows: dialogRows } = await pool.query(
+      `
+        SELECT id
+        FROM dialogs
+        WHERE kind = 'direct' AND direct_user_a = $1 AND direct_user_b = $2
+        LIMIT 1
+      `,
+      [userA, userB]
+    );
+
+    const dialogId = dialogRows[0]?.id || null;
+    if (!dialogId) {
+      res.status(200).json({ ok: true, page, limit, offset, dialogId: null, items: [] });
+      return;
+    }
 
     const { rows } = await pool.query(
       `
         SELECT
           id,
+          dialog_id AS "dialogId",
           sender_id AS "senderId",
           receiver_id AS "receiverId",
           content,
+          read_at AS "readAt",
+          edited_at AS "editedAt",
           created_at AS "createdAt"
         FROM messages
-        WHERE
-          (sender_id = $1 AND receiver_id = $2)
-          OR
-          (sender_id = $2 AND receiver_id = $1)
+        WHERE dialog_id = $1
         ORDER BY created_at DESC
-        LIMIT $3 OFFSET $4
+        LIMIT $2 OFFSET $3
       `,
-      [actor.id, otherUserId, limit, offset]
+      [dialogId, limit, offset]
     );
 
-    res.status(200).json({ ok: true, page, limit, offset, items: rows.map(mapMessageRow) });
+    await pool.query(
+      `
+        UPDATE messages
+        SET read_at = NOW(),
+            updated_at = NOW()
+        WHERE dialog_id = $1
+          AND receiver_id = $2
+          AND read_at IS NULL
+      `,
+      [dialogId, actor.id]
+    );
+    await pool.query(
+      `
+        UPDATE dialog_members
+        SET last_read_at = NOW()
+        WHERE dialog_id = $1
+          AND user_id = $2
+      `,
+      [dialogId, actor.id]
+    );
+
+    const ordered = rows.slice().reverse().map(mapMessageRow);
+    res.status(200).json({ ok: true, page, limit, offset, dialogId, items: ordered });
+  })
+);
+
+app.get(
+  '/api/chats',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const { limit, offset, page } = parsePagination(req);
+
+    const { rows } = await pool.query(
+      `
+        SELECT
+          d.id,
+          d.kind,
+          d.created_at AS "createdAt",
+          d.updated_at AS "updatedAt",
+          peer.id AS "peerId",
+          peer.username AS "peerUsername",
+          peer.display_name AS "peerDisplayName",
+          peer.avatar_url AS "peerAvatarUrl",
+          peer.is_verified AS "peerIsVerified",
+          COALESCE(unread.count, 0) AS "unreadCount",
+          last_message.id AS "lastMessageId",
+          last_message.sender_id AS "lastMessageSenderId",
+          last_message.receiver_id AS "lastMessageReceiverId",
+          last_message.content AS "lastMessageContent",
+          last_message.created_at AS "lastMessageCreatedAt"
+        FROM dialog_members dm
+        JOIN dialogs d ON d.id = dm.dialog_id
+        LEFT JOIN LATERAL (
+          SELECT
+            u.id,
+            u.username,
+            u.display_name,
+            u.avatar_url,
+            u.is_verified
+          FROM users u
+          WHERE u.id = CASE WHEN d.direct_user_a = $1 THEN d.direct_user_b ELSE d.direct_user_a END
+          LIMIT 1
+        ) peer ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT
+            m.id,
+            m.sender_id,
+            m.receiver_id,
+            m.content,
+            m.created_at
+          FROM messages m
+          WHERE m.dialog_id = d.id
+          ORDER BY m.created_at DESC
+          LIMIT 1
+        ) last_message ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::INT AS count
+          FROM messages m
+          WHERE m.dialog_id = d.id
+            AND m.receiver_id = $1
+            AND m.read_at IS NULL
+        ) unread ON TRUE
+        WHERE dm.user_id = $1
+        ORDER BY COALESCE(last_message.created_at, d.updated_at, d.created_at) DESC
+        LIMIT $2 OFFSET $3
+      `,
+      [actor.id, limit, offset]
+    );
+
+    res.status(200).json({ ok: true, page, limit, offset, items: rows.map(mapDialogRow) });
+  })
+);
+
+app.get(
+  '/api/admin/users',
+  requireAuth,
+  requireAdmin,
+  asyncRoute(async (_req, res) => {
+    const { rows } = await pool.query(
+      `
+        SELECT
+          id,
+          username,
+          email,
+          display_name AS "displayName",
+          avatar_url AS "avatarUrl",
+          bio,
+          role,
+          banned,
+          restricted,
+          is_verified AS "isVerified",
+          email_verification_required AS "emailVerificationRequired",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt"
+        FROM users
+        ORDER BY created_at DESC
+      `
+    );
+
+    res.status(200).json({ ok: true, items: rows });
+  })
+);
+
+app.patch(
+  '/api/admin/users/:id',
+  requireAuth,
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const targetUserId = sanitize(req.params.id);
+    if (!isUUID(targetUserId)) throw new HttpError(400, 'Invalid user id.');
+
+    const updates = [];
+    const values = [];
+    let index = 1;
+
+    if (req.body.role !== undefined) {
+      const role = sanitize(req.body.role).toLowerCase();
+      if (!ADMIN_ROLES.has(role)) throw new HttpError(400, 'Invalid role.');
+      if (targetUserId === actor.id && role !== 'admin') {
+        throw new HttpError(400, 'You cannot remove your own admin role.');
+      }
+      updates.push(`role = $${index}`);
+      values.push(role);
+      index += 1;
+    }
+    if (req.body.banned !== undefined) {
+      const banned = Boolean(req.body.banned);
+      if (targetUserId === actor.id && banned) {
+        throw new HttpError(400, 'You cannot ban yourself.');
+      }
+      updates.push(`banned = $${index}`);
+      values.push(banned);
+      index += 1;
+    }
+    if (req.body.restricted !== undefined) {
+      updates.push(`restricted = $${index}`);
+      values.push(Boolean(req.body.restricted));
+      index += 1;
+    }
+    if (req.body.isVerified !== undefined) {
+      updates.push(`is_verified = $${index}`);
+      values.push(Boolean(req.body.isVerified));
+      index += 1;
+      updates.push(`email_verification_required = $${index}`);
+      values.push(!Boolean(req.body.isVerified));
+      index += 1;
+    }
+
+    if (!updates.length) throw new HttpError(400, 'No fields provided for update.');
+
+    values.push(targetUserId);
+
+    const { rows } = await pool.query(
+      `
+        UPDATE users
+        SET ${updates.join(', ')},
+            updated_at = NOW()
+        WHERE id = $${index}
+        RETURNING
+          id,
+          username,
+          email,
+          display_name AS "displayName",
+          avatar_url AS "avatarUrl",
+          bio,
+          role,
+          banned,
+          restricted,
+          is_verified AS "isVerified",
+          email_verification_required AS "emailVerificationRequired",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt"
+      `,
+      values
+    );
+
+    const updatedUser = rows[0];
+    if (!updatedUser) throw new HttpError(404, 'User not found.');
+
+    res.status(200).json({ ok: true, user: updatedUser });
+  })
+);
+
+app.delete(
+  '/api/admin/posts/:id',
+  requireAuth,
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const postId = sanitize(req.params.id);
+    if (!isUUID(postId)) throw new HttpError(400, 'Invalid post id.');
+
+    const { rows } = await pool.query('SELECT user_id AS "userId" FROM posts WHERE id = $1 LIMIT 1', [postId]);
+    if (!rows[0]) throw new HttpError(404, 'Post not found.');
+
+    await pool.query('DELETE FROM posts WHERE id = $1', [postId]);
+
+    const authorId = rows[0].userId;
+    const { rows: followerRows } = await pool.query(
+      'SELECT follower_id AS "followerId" FROM follows WHERE following_id = $1',
+      [authorId]
+    );
+    const cacheTargets = [authorId, ...followerRows.map((item) => item.followerId)];
+    await invalidateFeedCacheForUsers(cacheTargets);
+
+    res.status(200).json({ ok: true });
+  })
+);
+
+app.get(
+  '/api/admin/sql/export',
+  requireAuth,
+  requireAdmin,
+  asyncRoute(async (_req, res) => {
+    const sqlDump = await createSqlDump();
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    res.setHeader('Content-Type', 'application/sql; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="aura-backup-${timestamp}.sql"`);
+    res.status(200).send(sqlDump);
+  })
+);
+
+app.post(
+  '/api/admin/sql/import',
+  requireAuth,
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const payload = typeof req.body === 'string' ? req.body : '';
+    const sql = payload.trim();
+    if (!sql) throw new HttpError(400, 'SQL payload is empty.');
+
+    await pool.query(sql);
+
+    if (redisReady) {
+      await redis.flushDb();
+    }
+
+    res.status(200).json({ ok: true, message: 'SQL import completed.' });
   })
 );
 

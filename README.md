@@ -10,6 +10,8 @@ Copy `.env.example` to `.env` and set real values:
 - `PGDATABASE`
 - `PGUSER`
 - `PGPASSWORD`
+- `JWT_SECRET`
+- `ADMIN_EMAILS`
 - `VITE_API_URL`
 - `CORS_ORIGIN`
 
@@ -26,3 +28,11 @@ Copy `.env.example` to `.env` and set real values:
 - Pool config: `server/config/database.ts`
 - PM2 config: `ecosystem.config.js`
 - Nginx config: `nginx/aura.conf`
+
+## Features
+
+- Telegram-like direct dialog model (`dialogs`, `dialog_members`, `messages.dialog_id`)
+- Redis feed caching
+- Email verification with 6-digit code
+- Admin moderation API (`/api/admin/users/:id`)
+- SQL backup/restore from admin panel (`/api/admin/sql/export`, `/api/admin/sql/import`)
