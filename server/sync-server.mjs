@@ -435,9 +435,8 @@ app.post(
 app.get(
   '/api/users/:id',
   asyncRoute(async (req, res) => {
-    if (!isUUID(req.params.id)) {
-      res.status(400).json({ error: 'Invalid user id' });
-      return;
+    if (!/^[0-9a-fA-F-]{36}$/.test(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid user id' });
     }
 
     const { rows } = await pool.query(
