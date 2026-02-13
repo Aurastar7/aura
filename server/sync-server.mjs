@@ -10,7 +10,6 @@ import jwt from 'jsonwebtoken';
 import helmet from 'helmet';
 import cors from 'cors';
 import { rateLimit } from 'express-rate-limit';
-import { RedisStore } from 'rate-limit-redis';
 import { WebSocketServer } from 'ws';
 import { validate as isUUID } from 'uuid';
 import { createPool } from './config/database.mjs';
@@ -84,6 +83,17 @@ const sendJsonError = (res, status, message, details) => {
 const isEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 const isUsername = (value) => /^[a-zA-Z0-9_.-]{3,32}$/.test(value);
 const sanitize = (value) => String(value ?? '').trim();
+const verifyPassword = async (plainPassword, storedHash) => {
+  if (!storedHash) return { ok: false, legacyPlain: false };
+  try {
+    const ok = await bcrypt.compare(plainPassword, storedHash);
+    if (ok) return { ok: true, legacyPlain: false };
+  } catch {
+    // ignore invalid hash format and fallback to legacy check
+  }
+  if (storedHash === plainPassword) return { ok: true, legacyPlain: true };
+  return { ok: false, legacyPlain: false };
+};
 const isAdminUser = (user) =>
   Boolean(user && (user.role === 'admin' || adminEmails.has(String(user.email || '').toLowerCase())));
 const sortUuidPair = (left, right) => (left <= right ? [left, right] : [right, left]);
@@ -514,17 +524,12 @@ app.use(
   })
 );
 
-const limiterStore = new RedisStore({
-  sendCommand: (...args) => redis.sendCommand(args),
-});
-
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
     max: GLOBAL_RATE_MAX,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
-    store: limiterStore,
   })
 );
 
@@ -533,7 +538,6 @@ const authLimiter = rateLimit({
   max: AUTH_RATE_MAX,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  store: limiterStore,
 });
 
 app.get(
@@ -662,6 +666,7 @@ app.post(
           email,
           password_hash AS "passwordHash",
           is_verified AS "isVerified",
+          email_verification_required AS "emailVerificationRequired",
           banned
         FROM users
         WHERE username = $1 OR email = $1
@@ -674,10 +679,50 @@ app.post(
     if (!user) throw new HttpError(401, 'Invalid credentials.');
     if (user.banned) throw new HttpError(403, 'Account is banned.');
 
-    const isValid = await bcrypt.compare(password, user.passwordHash);
-    if (!isValid) throw new HttpError(401, 'Invalid credentials.');
-    if (!user.isVerified) {
-      res.status(403).json({ ok: false, message: 'Email not verified.', requiresVerification: true, userId: user.id });
+    const passwordCheck = await verifyPassword(password, user.passwordHash);
+    if (!passwordCheck.ok) throw new HttpError(401, 'Invalid credentials.');
+
+    if (passwordCheck.legacyPlain) {
+      const nextHash = await bcrypt.hash(password, 12);
+      await pool.query(
+        `
+          UPDATE users
+          SET password_hash = $1,
+              is_verified = TRUE,
+              email_verification_required = FALSE,
+              updated_at = NOW()
+          WHERE id = $2
+        `,
+        [nextHash, user.id]
+      );
+      user.isVerified = true;
+      user.emailVerificationRequired = false;
+    }
+
+    const hasLegacyLocalEmail =
+      typeof user.email === 'string' && user.email.toLowerCase().endsWith('@aura.local');
+    if (!user.isVerified && hasLegacyLocalEmail) {
+      await pool.query(
+        `
+          UPDATE users
+          SET is_verified = TRUE,
+              email_verification_required = FALSE,
+              updated_at = NOW()
+          WHERE id = $1
+        `,
+        [user.id]
+      );
+      user.isVerified = true;
+      user.emailVerificationRequired = false;
+    }
+
+    if (verificationRequired && !user.isVerified) {
+      res.status(403).json({
+        ok: false,
+        message: 'Email not verified.',
+        requiresVerification: true,
+        userId: user.id,
+      });
       return;
     }
 
@@ -1654,7 +1699,11 @@ const start = async () => {
     await redis.connect();
     redisReady = true;
   } catch {
-    throw new Error('Redis connection failed.');
+    redisReady = false;
+    if (nodeEnv !== 'production') {
+      // eslint-disable-next-line no-console
+      console.warn('Redis is unavailable. Running without cache-backed features.');
+    }
   }
 
   server.listen(port);
