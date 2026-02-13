@@ -45,6 +45,20 @@ const toInt = (value, fallback) => {
 const GLOBAL_RATE_MAX = toInt(process.env.RATE_LIMIT_GLOBAL_MAX, 100);
 const AUTH_RATE_MAX = toInt(process.env.RATE_LIMIT_AUTH_MAX, 5);
 const FEED_LIMIT_MAX = toInt(process.env.FEED_LIMIT_MAX, 50);
+const FEED_CACHE_TTL_SEC = toInt(process.env.FEED_CACHE_TTL_SEC, 45);
+const FEED_CACHE_INDEX_TTL_SEC = toInt(process.env.FEED_CACHE_INDEX_TTL_SEC, 120);
+const CHAT_LIST_CACHE_TTL_SEC = toInt(process.env.CHAT_LIST_CACHE_TTL_SEC, 12);
+const BOOTSTRAP_ADMIN_ENABLED = String(process.env.BOOTSTRAP_ADMIN_ENABLED || 'true') !== 'false';
+const BOOTSTRAP_ADMIN_USERNAME = String(process.env.BOOTSTRAP_ADMIN_USERNAME || '313').trim().toLowerCase();
+const BOOTSTRAP_ADMIN_PASSWORD = String(process.env.BOOTSTRAP_ADMIN_PASSWORD || '313');
+const BOOTSTRAP_ADMIN_EMAIL = String(
+  process.env.BOOTSTRAP_ADMIN_EMAIL || `${BOOTSTRAP_ADMIN_USERNAME}@aura.local`
+)
+  .trim()
+  .toLowerCase();
+const BOOTSTRAP_ADMIN_DISPLAY_NAME = String(
+  process.env.BOOTSTRAP_ADMIN_DISPLAY_NAME || 'Aura Admin'
+).trim();
 
 const allowedOrigins = String(process.env.CORS_ORIGIN || '')
   .split(',')
@@ -205,6 +219,91 @@ const withTransaction = async (work) => {
   } finally {
     client.release();
   }
+};
+
+const schemaFilePath = path.resolve(rootDir, 'server', 'db', 'schema.sql');
+const legacyStatePath = path.resolve(rootDir, 'server', 'data', 'sync-db.json');
+
+const isBcryptHash = (value) => /^\$2[aby]\$\d{2}\$/.test(String(value || ''));
+
+const readLegacySeedUser = async () => {
+  try {
+    const raw = await fs.readFile(legacyStatePath, 'utf8');
+    if (!raw.trim()) return null;
+
+    const parsed = JSON.parse(raw);
+    const state =
+      parsed && typeof parsed === 'object' && parsed.state && typeof parsed.state === 'object'
+        ? parsed.state
+        : parsed;
+
+    const firstUser = Array.isArray(state?.users) ? state.users[0] : null;
+    if (!firstUser || typeof firstUser !== 'object') return null;
+
+    const username = sanitize(firstUser.username).toLowerCase();
+    const password = String(firstUser.password || '');
+    if (!isUsername(username) || password.length < 3) return null;
+
+    const emailRaw = sanitize(firstUser.email || `${username}@aura.local`).toLowerCase();
+    const email = isEmail(emailRaw) ? emailRaw : `${username}@aura.local`;
+    const displayName = sanitize(firstUser.displayName || username);
+    const candidateRole = sanitize(firstUser.role || '').toLowerCase();
+    const role = ADMIN_ROLES.has(candidateRole) ? candidateRole : 'admin';
+
+    return { username, password, email, displayName, role };
+  } catch {
+    return null;
+  }
+};
+
+const ensureDatabaseSchema = async () => {
+  const schemaSql = await fs.readFile(schemaFilePath, 'utf8');
+  await pool.query(schemaSql);
+};
+
+const ensureBootstrapAdmin = async () => {
+  if (!BOOTSTRAP_ADMIN_ENABLED) return;
+
+  const { rows } = await pool.query('SELECT COUNT(*)::INT AS total FROM users');
+  const totalUsers = Number(rows[0]?.total || 0);
+  if (totalUsers > 0) return;
+
+  const legacy = await readLegacySeedUser();
+  const seed = legacy || {
+    username: BOOTSTRAP_ADMIN_USERNAME,
+    password: BOOTSTRAP_ADMIN_PASSWORD,
+    email: BOOTSTRAP_ADMIN_EMAIL,
+    displayName: BOOTSTRAP_ADMIN_DISPLAY_NAME,
+    role: 'admin',
+  };
+
+  const username = sanitize(seed.username).toLowerCase();
+  const email = sanitize(seed.email || `${username}@aura.local`).toLowerCase();
+  const displayName = sanitize(seed.displayName || username);
+  const role = ADMIN_ROLES.has(seed.role) ? seed.role : 'admin';
+  const passwordRaw = String(seed.password || '');
+  if (!isUsername(username) || !isEmail(email) || passwordRaw.length < 3) return;
+
+  const passwordHash = isBcryptHash(passwordRaw)
+    ? passwordRaw
+    : await bcrypt.hash(passwordRaw, 12);
+
+  await pool.query(
+    `
+      INSERT INTO users (
+        username,
+        email,
+        password_hash,
+        display_name,
+        role,
+        is_verified,
+        email_verification_required
+      )
+      VALUES ($1, $2, $3, $4, $5, TRUE, FALSE)
+      ON CONFLICT (username) DO NOTHING
+    `,
+    [username, email, passwordHash, displayName || username, role]
+  );
 };
 
 const quoteIdentifier = (value) => `"${String(value).replace(/"/g, '""')}"`;
@@ -389,13 +488,15 @@ const ensureDirectDialog = async (client, leftUserId, rightUserId) => {
 
 const cacheFeedKey = (userId, page, limit) => `feed:${userId}:${page}:${limit}`;
 const cacheFeedSetKey = (userId) => `feedkeys:${userId}`;
+const cacheChatsKey = (userId, page, limit) => `chats:${userId}:${page}:${limit}`;
+const cacheChatsSetKey = (userId) => `chatkeys:${userId}`;
 
 const setCachedFeed = async (userId, page, limit, payload) => {
   if (!redisReady) return;
   const key = cacheFeedKey(userId, page, limit);
-  await redis.setEx(key, 30, JSON.stringify(payload));
+  await redis.setEx(key, FEED_CACHE_TTL_SEC, JSON.stringify(payload));
   await redis.sAdd(cacheFeedSetKey(userId), key);
-  await redis.expire(cacheFeedSetKey(userId), 60);
+  await redis.expire(cacheFeedSetKey(userId), FEED_CACHE_INDEX_TTL_SEC);
 };
 
 const getCachedFeed = async (userId, page, limit) => {
@@ -414,6 +515,40 @@ const invalidateFeedCacheForUsers = async (userIds) => {
 
   for (const userId of userIds) {
     const setKey = cacheFeedSetKey(userId);
+    const keys = await redis.sMembers(setKey);
+    if (keys.length) {
+      await redis.del(keys);
+    }
+    await redis.del(setKey);
+  }
+};
+
+const setCachedChats = async (userId, page, limit, payload) => {
+  if (!redisReady) return;
+  const key = cacheChatsKey(userId, page, limit);
+  await redis.setEx(key, CHAT_LIST_CACHE_TTL_SEC, JSON.stringify(payload));
+  await redis.sAdd(cacheChatsSetKey(userId), key);
+  await redis.expire(cacheChatsSetKey(userId), CHAT_LIST_CACHE_TTL_SEC * 2);
+};
+
+const getCachedChats = async (userId, page, limit) => {
+  if (!redisReady) return null;
+  const raw = await redis.get(cacheChatsKey(userId, page, limit));
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+};
+
+const invalidateChatsCacheForUsers = async (userIds) => {
+  if (!redisReady || !userIds.length) return;
+  const uniqueUserIds = [...new Set(userIds.filter(Boolean))];
+  if (!uniqueUserIds.length) return;
+
+  for (const userId of uniqueUserIds) {
+    const setKey = cacheChatsSetKey(userId);
     const keys = await redis.sMembers(setKey);
     if (keys.length) {
       await redis.del(keys);
@@ -1275,6 +1410,7 @@ app.post(
       return mapMessageRow(inserted.rows[0]);
     });
 
+    await invalidateChatsCacheForUsers([actor.id, receiverId]);
     wsBroadcastMessage(message);
     res.status(201).json({ ok: true, message });
   })
@@ -1345,6 +1481,7 @@ app.get(
       `,
       [dialogId, actor.id]
     );
+    await invalidateChatsCacheForUsers([actor.id]);
 
     const ordered = rows.slice().reverse().map(mapMessageRow);
     res.status(200).json({ ok: true, page, limit, offset, dialogId, items: ordered });
@@ -1357,6 +1494,12 @@ app.get(
   asyncRoute(async (req, res) => {
     const actor = req.user;
     const { limit, offset, page } = parsePagination(req);
+
+    const cached = await getCachedChats(actor.id, page, limit);
+    if (cached) {
+      res.status(200).json(cached);
+      return;
+    }
 
     const { rows } = await pool.query(
       `
@@ -1415,7 +1558,9 @@ app.get(
       [actor.id, limit, offset]
     );
 
-    res.status(200).json({ ok: true, page, limit, offset, items: rows.map(mapDialogRow) });
+    const payload = { ok: true, page, limit, offset, items: rows.map(mapDialogRow) };
+    await setCachedChats(actor.id, page, limit, payload);
+    res.status(200).json(payload);
   })
 );
 
@@ -1695,6 +1840,9 @@ const shutdown = async () => {
 };
 
 const start = async () => {
+  await ensureDatabaseSchema();
+  await ensureBootstrapAdmin();
+
   try {
     await redis.connect();
     redisReady = true;
@@ -1717,7 +1865,9 @@ process.on('SIGTERM', () => {
   void shutdown();
 });
 
-start().catch(async () => {
+start().catch(async (error) => {
+  // eslint-disable-next-line no-console
+  console.error('Failed to start sync server:', error);
   try {
     await pool.end();
   } catch {

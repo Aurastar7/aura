@@ -12,6 +12,11 @@ Copy `.env.example` to `.env` and set real values:
 - `PGPASSWORD`
 - `JWT_SECRET`
 - `ADMIN_EMAILS`
+- `BOOTSTRAP_ADMIN_ENABLED`
+- `BOOTSTRAP_ADMIN_USERNAME`
+- `BOOTSTRAP_ADMIN_PASSWORD`
+- `BOOTSTRAP_ADMIN_EMAIL`
+- `BOOTSTRAP_ADMIN_DISPLAY_NAME`
 - `VITE_API_URL`
 - `CORS_ORIGIN`
 
@@ -33,6 +38,8 @@ Copy `.env.example` to `.env` and set real values:
 
 - Telegram-like direct dialog model (`dialogs`, `dialog_members`, `messages.dialog_id`)
 - Redis feed caching
+- Redis chat list caching
 - Email verification with 6-digit code
 - Admin moderation API (`/api/admin/users/:id`)
 - SQL backup/restore from admin panel (`/api/admin/sql/export`, `/api/admin/sql/import`)
+- Auto schema init on backend start + bootstrap admin seed for first run
