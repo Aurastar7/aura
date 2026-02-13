@@ -10,6 +10,7 @@ import cors from 'cors';
 import { rateLimit } from 'express-rate-limit';
 import { RedisStore } from 'rate-limit-redis';
 import { WebSocketServer } from 'ws';
+import { validate as isUUID } from 'uuid';
 import { createPool } from './config/database.mjs';
 import { createRedis } from './config/redis.mjs';
 import { createMailer } from './config/mailer.mjs';
@@ -432,8 +433,13 @@ app.post(
 );
 
 app.get(
-  '/api/users/:id([0-9a-fA-F-]{36})',
+  '/api/users/:id',
   asyncRoute(async (req, res) => {
+    if (!isUUID(req.params.id)) {
+      res.status(400).json({ error: 'Invalid user id' });
+      return;
+    }
+
     const { rows } = await pool.query(
       `
         SELECT
@@ -688,8 +694,13 @@ app.post(
 );
 
 app.get(
-  '/api/users/:id([0-9a-fA-F-]{36})/posts',
+  '/api/users/:id/posts',
   asyncRoute(async (req, res) => {
+    if (!isUUID(req.params.id)) {
+      res.status(400).json({ error: 'Invalid user id' });
+      return;
+    }
+
     const { limit, offset, page } = parsePagination(req);
     const { rows } = await pool.query(
       `
