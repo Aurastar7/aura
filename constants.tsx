@@ -63,4 +63,10 @@ export const ICONS = {
       <path strokeLinecap="round" strokeLinejoin="round" d="M18 18.72a9.094 9.094 0 0 0 3.742-.479 3 3 0 0 0-4.682-2.72m.94 3.198v-.75c0-.65-.123-1.272-.35-1.844m0 0a5.971 5.971 0 0 0-1.922-2.996M12 18.75a7.5 7.5 0 0 0 7.5-7.5c0-.34-.023-.674-.067-1.001m-7.433 8.5a7.5 7.5 0 0 1-7.5-7.5c0-.34.023-.674.067-1.001m14.866 0A7.5 7.5 0 0 0 4.567 10.25m14.866 0a5.96 5.96 0 0 0-1.783-3.833M4.567 10.25A5.96 5.96 0 0 1 6.35 6.417m0 0A5.978 5.978 0 0 1 12 4.5c1.52 0 2.908.568 3.95 1.5m-9.6.417a3.75 3.75 0 1 0 5.3 5.3 3.75 3.75 0 0 0-5.3-5.3Z" />
     </svg>
   ),
+  Settings: (props: any) => (
+    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" {...props}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M10.5 6h3m-3 12h3M6.75 10.5v3m10.5-3v3M4.5 8.25l2.25 1.5m13.5-1.5-2.25 1.5M4.5 15.75l2.25-1.5m13.5 1.5-2.25-1.5" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 15.75a3.75 3.75 0 1 0 0-7.5 3.75 3.75 0 0 0 0 7.5Z" />
+    </svg>
+  ),
 };

@@ -1,5 +1,17 @@
 # Aura Social (VPS Deployment)
 
+## Docker Compose (1 VPS)
+
+Production-like stack on a single VPS: Nginx (web) + Node API/WS (app) + PostgreSQL + Redis + NATS (JetStream) + MinIO.
+
+- Start: `docker compose up -d --build`
+- Logs: `docker compose logs -f --tail=200 app web`
+- Stop: `docker compose down`
+
+Notes:
+- By default MinIO/NATS monitoring ports are bound to `127.0.0.1` only.
+- Set secrets via `.env` (do not commit real values). Email verification is disabled by default in `docker-compose.yml` (`EMAIL_VERIFICATION_REQUIRED=false`).
+
 ## Required environment
 
 Copy `.env.example` to `.env` and set real values:

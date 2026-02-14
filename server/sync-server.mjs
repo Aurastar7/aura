@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { promises as fs } from 'node:fs';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
@@ -27,6 +28,7 @@ dotenv.config();
 const port = Number(process.env.PORT || process.env.SYNC_PORT || 3001);
 const jwtSecret = process.env.JWT_SECRET || '';
 const nodeEnv = process.env.NODE_ENV || 'development';
+const JSON_BODY_LIMIT = String(process.env.JSON_BODY_LIMIT || '10mb');
 const verificationRequired = String(process.env.EMAIL_VERIFICATION_REQUIRED || 'true') !== 'false';
 const mailFrom = process.env.MAIL_FROM || 'Aura Social <no-reply@aura.local>';
 const adminEmails = new Set(
@@ -48,6 +50,10 @@ const FEED_LIMIT_MAX = toInt(process.env.FEED_LIMIT_MAX, 50);
 const FEED_CACHE_TTL_SEC = toInt(process.env.FEED_CACHE_TTL_SEC, 45);
 const FEED_CACHE_INDEX_TTL_SEC = toInt(process.env.FEED_CACHE_INDEX_TTL_SEC, 120);
 const CHAT_LIST_CACHE_TTL_SEC = toInt(process.env.CHAT_LIST_CACHE_TTL_SEC, 12);
+const EMAIL_CODE_TTL_SEC = toInt(process.env.EMAIL_CODE_TTL_SEC, 600);
+const EMAIL_CODE_MAX_ATTEMPTS = toInt(process.env.EMAIL_CODE_MAX_ATTEMPTS, 10);
+const EMAIL_CODE_PEPPER = String(process.env.EMAIL_CODE_PEPPER || jwtSecret || 'aura-email-code');
+const WS_MESSAGE_CHANNEL = String(process.env.REDIS_WS_CHANNEL || 'aura:ws:message').trim();
 const BOOTSTRAP_ADMIN_ENABLED = String(process.env.BOOTSTRAP_ADMIN_ENABLED || 'true') !== 'false';
 const BOOTSTRAP_ADMIN_USERNAME = String(process.env.BOOTSTRAP_ADMIN_USERNAME || '313').trim().toLowerCase();
 const BOOTSTRAP_ADMIN_PASSWORD = String(process.env.BOOTSTRAP_ADMIN_PASSWORD || '313');
@@ -67,9 +73,11 @@ const allowedOrigins = String(process.env.CORS_ORIGIN || '')
 
 const pool = createPool();
 const redis = createRedis();
+const redisSubscriber = redis.duplicate();
 const mailer = createMailer();
 
 let redisReady = false;
+let redisPubSubReady = false;
 
 class HttpError extends Error {
   constructor(statusCode, message, details) {
@@ -145,6 +153,9 @@ const loadUserById = async (userId) => {
         display_name AS "displayName",
         avatar_url AS "avatarUrl",
         bio,
+        status,
+        cover_image_url AS "coverImage",
+        hidden_from_friends AS "hiddenFromFriends",
         role,
         banned,
         restricted,
@@ -180,6 +191,17 @@ const requireAdmin = (req, _res, next) => {
 };
 
 const sixDigitCode = () => String(Math.floor(100000 + Math.random() * 900000));
+const safeEqual = (left, right) => {
+  const leftBuffer = Buffer.from(String(left), 'utf8');
+  const rightBuffer = Buffer.from(String(right), 'utf8');
+  if (leftBuffer.length !== rightBuffer.length) return false;
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+};
+const hashEmailCode = (userId, purpose, code) =>
+  crypto
+    .createHmac('sha256', EMAIL_CODE_PEPPER)
+    .update(`${userId}:${purpose}:${code}`)
+    .digest('hex');
 
 const sendCodeEmail = async (to, subject, code) => {
   await mailer.sendMail({
@@ -191,20 +213,95 @@ const sendCodeEmail = async (to, subject, code) => {
   });
 };
 
-const redisSetWithTtl = async (key, value, seconds) => {
-  if (!redisReady) return;
-  await redis.setEx(key, seconds, value);
+const saveEmailCode = async ({ userId, purpose, code, targetEmail = null }) => {
+  const codeHash = hashEmailCode(userId, purpose, code);
+  await pool.query(
+    `
+      INSERT INTO email_verification_codes (
+        user_id,
+        purpose,
+        code_hash,
+        target_email,
+        attempts,
+        expires_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        0,
+        NOW() + ($5::INT * INTERVAL '1 second'),
+        NOW()
+      )
+      ON CONFLICT (user_id, purpose)
+      DO UPDATE
+        SET code_hash = EXCLUDED.code_hash,
+            target_email = EXCLUDED.target_email,
+            attempts = 0,
+            expires_at = EXCLUDED.expires_at,
+            updated_at = NOW()
+    `,
+    [userId, purpose, codeHash, targetEmail, EMAIL_CODE_TTL_SEC]
+  );
 };
 
-const redisGet = async (key) => {
-  if (!redisReady) return null;
-  return redis.get(key);
-};
+const consumeEmailCode = async ({ userId, purpose, code }) =>
+  withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `
+        SELECT
+          code_hash AS "codeHash",
+          target_email AS "targetEmail",
+          expires_at AS "expiresAt",
+          attempts
+        FROM email_verification_codes
+        WHERE user_id = $1 AND purpose = $2
+        FOR UPDATE
+      `,
+      [userId, purpose]
+    );
 
-const redisDel = async (key) => {
-  if (!redisReady) return;
-  await redis.del(key);
-};
+    const row = rows[0];
+    if (!row) return { ok: false, reason: 'missing' };
+    const expiresAt = row.expiresAt ? new Date(row.expiresAt).getTime() : 0;
+    if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
+      await client.query(
+        'DELETE FROM email_verification_codes WHERE user_id = $1 AND purpose = $2',
+        [userId, purpose]
+      );
+      return { ok: false, reason: 'expired' };
+    }
+
+    const incomingHash = hashEmailCode(userId, purpose, code);
+    if (!safeEqual(row.codeHash, incomingHash)) {
+      const nextAttempts = Number(row.attempts || 0) + 1;
+      if (nextAttempts >= EMAIL_CODE_MAX_ATTEMPTS) {
+        await client.query(
+          'DELETE FROM email_verification_codes WHERE user_id = $1 AND purpose = $2',
+          [userId, purpose]
+        );
+      } else {
+        await client.query(
+          `
+            UPDATE email_verification_codes
+            SET attempts = $3,
+                updated_at = NOW()
+            WHERE user_id = $1 AND purpose = $2
+          `,
+          [userId, purpose, nextAttempts]
+        );
+      }
+      return { ok: false, reason: 'mismatch' };
+    }
+
+    await client.query('DELETE FROM email_verification_codes WHERE user_id = $1 AND purpose = $2', [
+      userId,
+      purpose,
+    ]);
+    return { ok: true, targetEmail: row.targetEmail || null };
+  });
 
 const withTransaction = async (work) => {
   const client = await pool.connect();
@@ -220,6 +317,8 @@ const withTransaction = async (work) => {
     client.release();
   }
 };
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const schemaFilePath = path.resolve(rootDir, 'server', 'db', 'schema.sql');
 const legacyStatePath = path.resolve(rootDir, 'server', 'data', 'sync-db.json');
@@ -261,10 +360,15 @@ const ensureDatabaseSchema = async () => {
   await pool.query(schemaSql);
 };
 
-const ensureBootstrapAdmin = async () => {
+const ensureDatabaseSchemaWithClient = async (client) => {
+  const schemaSql = await fs.readFile(schemaFilePath, 'utf8');
+  await client.query(schemaSql);
+};
+
+const ensureBootstrapAdminWithClient = async (client) => {
   if (!BOOTSTRAP_ADMIN_ENABLED) return;
 
-  const { rows } = await pool.query('SELECT COUNT(*)::INT AS total FROM users');
+  const { rows } = await client.query('SELECT COUNT(*)::INT AS total FROM users');
   const totalUsers = Number(rows[0]?.total || 0);
   if (totalUsers > 0) return;
 
@@ -288,7 +392,7 @@ const ensureBootstrapAdmin = async () => {
     ? passwordRaw
     : await bcrypt.hash(passwordRaw, 12);
 
-  await pool.query(
+  await client.query(
     `
       INSERT INTO users (
         username,
@@ -304,6 +408,61 @@ const ensureBootstrapAdmin = async () => {
     `,
     [username, email, passwordHash, displayName || username, role]
   );
+};
+
+const INIT_LOCK_KEY_A = 1096048961; // 'AURA' in ASCII
+const INIT_LOCK_KEY_B = 1397701964; // 'SOCL' in ASCII
+
+const ensureDatabaseReady = async () => {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      'SELECT pg_try_advisory_lock($1, $2) AS locked',
+      [INIT_LOCK_KEY_A, INIT_LOCK_KEY_B]
+    );
+
+    if (rows[0]?.locked) {
+      try {
+        await ensureDatabaseSchemaWithClient(client);
+        await ensureBootstrapAdminWithClient(client);
+      } finally {
+        try {
+          await client.query('SELECT pg_advisory_unlock($1, $2)', [INIT_LOCK_KEY_A, INIT_LOCK_KEY_B]);
+        } catch {
+          // ignore unlock errors
+        }
+      }
+      return;
+    }
+
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      try {
+        const { rows: readyRows } = await client.query(
+          "SELECT to_regclass('public.users') IS NOT NULL AS ok"
+        );
+        if (readyRows[0]?.ok) return;
+      } catch {
+        // ignore schema probing errors
+      }
+      await sleep(250);
+    }
+
+    // If initialization stalled, take the lock and finish it ourselves.
+    await client.query('SELECT pg_advisory_lock($1, $2)', [INIT_LOCK_KEY_A, INIT_LOCK_KEY_B]);
+    try {
+      await ensureDatabaseSchemaWithClient(client);
+      await ensureBootstrapAdminWithClient(client);
+    } finally {
+      try {
+        await client.query('SELECT pg_advisory_unlock($1, $2)', [INIT_LOCK_KEY_A, INIT_LOCK_KEY_B]);
+      } catch {
+        // ignore unlock errors
+      }
+    }
+  } finally {
+    client.release();
+  }
 };
 
 const quoteIdentifier = (value) => `"${String(value).replace(/"/g, '""')}"`;
@@ -562,12 +721,35 @@ const mapPostRow = (row) => ({
   userId: row.userId,
   content: row.content,
   createdAt: row.createdAt,
-  author: {
-    id: row.authorId,
-    username: row.authorUsername,
-    displayName: row.authorDisplayName,
-    avatarUrl: row.authorAvatarUrl,
-  },
+  likedBy: Array.isArray(row.likedBy) ? row.likedBy.map((item) => String(item)) : [],
+  repostedBy: Array.isArray(row.repostedBy) ? row.repostedBy.map((item) => String(item)) : [],
+  author: row.authorId
+    ? {
+        id: row.authorId,
+        username: row.authorUsername,
+        displayName: row.authorDisplayName,
+        avatarUrl: row.authorAvatarUrl,
+        bio: row.authorBio,
+        status: row.authorStatus,
+        coverImage: row.authorCoverImage,
+        hiddenFromFriends: row.authorHiddenFromFriends,
+        role: row.authorRole,
+        banned: row.authorBanned,
+        restricted: row.authorRestricted,
+        isVerified: row.authorIsVerified,
+        createdAt: row.authorCreatedAt,
+        updatedAt: row.authorUpdatedAt,
+      }
+    : null,
+});
+
+const mapPostCommentRow = (row) => ({
+  id: row.id,
+  postId: row.postId,
+  authorId: row.authorId,
+  text: row.text,
+  likedBy: Array.isArray(row.likedBy) ? row.likedBy.map((item) => String(item)) : [],
+  createdAt: row.createdAt,
 });
 
 const mapMessageRow = (row) => ({
@@ -578,6 +760,52 @@ const mapMessageRow = (row) => ({
   content: row.content,
   readAt: row.readAt,
   editedAt: row.editedAt,
+  createdAt: row.createdAt,
+});
+
+const mapGroupRow = (row) => ({
+  id: row.id,
+  name: row.name,
+  description: row.description,
+  adminId: row.adminId,
+  allowMemberPosts: row.allowMemberPosts,
+  avatar: row.avatar,
+  coverImage: row.coverImage,
+  verified: row.verified,
+  createdAt: row.createdAt,
+  updatedAt: row.updatedAt,
+});
+
+const mapGroupMemberRow = (row) => ({
+  id: row.id,
+  groupId: row.groupId,
+  userId: row.userId,
+  role: row.role,
+  createdAt: row.createdAt,
+});
+
+const normalizeUuidArray = (value) =>
+  Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
+
+const mapGroupPostRow = (row) => ({
+  id: row.id,
+  groupId: row.groupId,
+  authorId: row.authorId,
+  text: row.text,
+  mediaType: row.mediaType || undefined,
+  mediaUrl: row.mediaUrl || undefined,
+  repostOfPostId: row.repostOfPostId || undefined,
+  createdAt: row.createdAt,
+  likedBy: normalizeUuidArray(row.likedBy),
+  repostedBy: normalizeUuidArray(row.repostedBy),
+});
+
+const mapGroupCommentRow = (row) => ({
+  id: row.id,
+  groupPostId: row.groupPostId,
+  authorId: row.authorId,
+  text: row.text,
+  likedBy: normalizeUuidArray(row.likedBy),
   createdAt: row.createdAt,
 });
 
@@ -593,7 +821,16 @@ const mapDialogRow = (row) => ({
         username: row.peerUsername,
         displayName: row.peerDisplayName,
         avatarUrl: row.peerAvatarUrl,
+        bio: row.peerBio,
+        status: row.peerStatus,
+        coverImage: row.peerCoverImage,
+        hiddenFromFriends: row.peerHiddenFromFriends,
+        role: row.peerRole,
+        banned: row.peerBanned,
+        restricted: row.peerRestricted,
         isVerified: row.peerIsVerified,
+        createdAt: row.peerCreatedAt,
+        updatedAt: row.peerUpdatedAt,
       }
     : null,
   lastMessage: row.lastMessageId
@@ -614,13 +851,25 @@ const wsSend = (socket, payload) => {
   if (socket.readyState === 1) socket.send(JSON.stringify(payload));
 };
 
-const wsBroadcastMessage = (message) => {
+const wsBroadcastLocalMessage = (message) => {
   const recipients = new Set([message.senderId, message.receiverId]);
   wss.clients.forEach((socket) => {
     const socketUserId = wsAuthBySocket.get(socket);
     if (!socketUserId || !recipients.has(socketUserId)) return;
     wsSend(socket, { type: 'message:new', message });
   });
+};
+
+const wsBroadcastMessage = async (message) => {
+  if (redisPubSubReady) {
+    try {
+      await redis.publish(WS_MESSAGE_CHANNEL, JSON.stringify(message));
+      return;
+    } catch {
+      // fallback to local delivery
+    }
+  }
+  wsBroadcastLocalMessage(message);
 };
 
 const app = express();
@@ -650,7 +899,7 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
 app.use(
   '/api/admin/sql/import',
   express.text({
@@ -739,7 +988,7 @@ app.post(
 
     if (verificationRequired) {
       const code = sixDigitCode();
-      await redisSetWithTtl(`verify:${user.id}`, code, 600);
+      await saveEmailCode({ userId: user.id, purpose: 'register', code, targetEmail: user.email });
       await sendCodeEmail(user.email, 'Verify your Aura Social account', code);
       res.status(201).json({ ok: true, requiresVerification: true, userId: user.id });
       return;
@@ -760,8 +1009,11 @@ app.post(
 
     if (!userId || !code) throw new HttpError(400, 'userId and code are required.');
 
-    const stored = await redisGet(`verify:${userId}`);
-    if (!stored || stored !== code) throw new HttpError(400, 'Invalid verification code.');
+    const verification = await consumeEmailCode({ userId, purpose: 'register', code });
+    if (!verification.ok) {
+      if (verification.reason === 'expired') throw new HttpError(400, 'Verification code expired.');
+      throw new HttpError(400, 'Invalid verification code.');
+    }
 
     await pool.query(
       `
@@ -774,13 +1026,48 @@ app.post(
       [userId]
     );
 
-    await redisDel(`verify:${userId}`);
-
     const user = await loadUserById(userId);
     if (!user) throw new HttpError(404, 'User not found.');
 
     const token = signToken(userId);
     res.status(200).json({ ok: true, token, user });
+  })
+);
+
+app.post(
+  '/api/auth/resend-verification',
+  authLimiter,
+  asyncRoute(async (req, res) => {
+    const userId = sanitize(req.body.userId);
+    if (!isUUID(userId)) throw new HttpError(400, 'Valid userId is required.');
+
+    const { rows } = await pool.query(
+      `
+        SELECT
+          id,
+          email,
+          banned,
+          is_verified AS "isVerified",
+          email_verification_required AS "emailVerificationRequired"
+        FROM users
+        WHERE id = $1
+        LIMIT 1
+      `,
+      [userId]
+    );
+
+    const user = rows[0];
+    if (!user) throw new HttpError(404, 'User not found.');
+    if (user.banned) throw new HttpError(403, 'Account is banned.');
+    if (user.isVerified || !user.emailVerificationRequired) {
+      res.status(200).json({ ok: true, message: 'Email is already verified.' });
+      return;
+    }
+
+    const code = sixDigitCode();
+    await saveEmailCode({ userId: user.id, purpose: 'register', code, targetEmail: user.email });
+    await sendCodeEmail(user.email, 'Verify your Aura Social account', code);
+    res.status(200).json({ ok: true, message: 'Verification code sent.' });
   })
 );
 
@@ -852,6 +1139,13 @@ app.post(
     }
 
     if (verificationRequired && !user.isVerified) {
+      try {
+        const code = sixDigitCode();
+        await saveEmailCode({ userId: user.id, purpose: 'register', code, targetEmail: user.email });
+        await sendCodeEmail(user.email, 'Verify your Aura Social account', code);
+      } catch {
+        // keep explicit verification response even if resend fails
+      }
       res.status(403).json({
         ok: false,
         message: 'Email not verified.',
@@ -864,6 +1158,15 @@ app.post(
     const fullUser = await loadUserById(user.id);
     const token = signToken(user.id);
     res.status(200).json({ ok: true, token, user: fullUser });
+  })
+);
+
+app.get(
+  '/api/users/me',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    res.status(200).json({ ok: true, user: actor });
   })
 );
 
@@ -882,11 +1185,15 @@ app.get(
           u.display_name AS "displayName",
           u.avatar_url AS "avatarUrl",
           u.bio,
+          u.status,
+          u.cover_image_url AS "coverImage",
+          u.hidden_from_friends AS "hiddenFromFriends",
           u.role,
           u.banned,
           u.restricted,
           u.is_verified AS "isVerified",
           u.created_at AS "createdAt",
+          u.updated_at AS "updatedAt",
           COALESCE(followers.count, 0) AS "followersCount",
           COALESCE(following.count, 0) AS "followingCount"
         FROM users u
@@ -908,15 +1215,6 @@ app.get(
 );
 
 app.get(
-  '/api/users/me',
-  requireAuth,
-  asyncRoute(async (req, res) => {
-    const actor = req.user;
-    res.status(200).json({ ok: true, user: actor });
-  })
-);
-
-app.get(
   '/api/users',
   asyncRoute(async (req, res) => {
     const { limit, offset, page } = parsePagination(req);
@@ -931,6 +1229,9 @@ app.get(
             display_name AS "displayName",
             avatar_url AS "avatarUrl",
             bio,
+            status,
+            cover_image_url AS "coverImage",
+            hidden_from_friends AS "hiddenFromFriends",
             role,
             banned,
             restricted,
@@ -956,6 +1257,9 @@ app.get(
           display_name AS "displayName",
           avatar_url AS "avatarUrl",
           bio,
+          status,
+          cover_image_url AS "coverImage",
+          hidden_from_friends AS "hiddenFromFriends",
           role,
           banned,
           restricted,
@@ -981,6 +1285,10 @@ app.put(
     const displayName = req.body.displayName !== undefined ? sanitize(req.body.displayName) : null;
     const avatarUrl = req.body.avatarUrl !== undefined ? sanitize(req.body.avatarUrl) : null;
     const bio = req.body.bio !== undefined ? String(req.body.bio || '') : null;
+    const status = req.body.status !== undefined ? String(req.body.status || '') : null;
+    const coverImage = req.body.coverImage !== undefined ? sanitize(req.body.coverImage) : null;
+    const hiddenFromFriends =
+      req.body.hiddenFromFriends !== undefined ? Boolean(req.body.hiddenFromFriends) : null;
 
     const updates = [];
     const values = [];
@@ -1001,6 +1309,21 @@ app.put(
       values.push(bio);
       index += 1;
     }
+    if (status !== null) {
+      updates.push(`status = $${index}`);
+      values.push(status);
+      index += 1;
+    }
+    if (coverImage !== null) {
+      updates.push(`cover_image_url = $${index}`);
+      values.push(coverImage || null);
+      index += 1;
+    }
+    if (hiddenFromFriends !== null) {
+      updates.push(`hidden_from_friends = $${index}`);
+      values.push(hiddenFromFriends);
+      index += 1;
+    }
 
     if (!updates.length) throw new HttpError(400, 'Nothing to update.');
 
@@ -1018,6 +1341,9 @@ app.put(
           display_name AS "displayName",
           avatar_url AS "avatarUrl",
           bio,
+          status,
+          cover_image_url AS "coverImage",
+          hidden_from_friends AS "hiddenFromFriends",
           role,
           banned,
           restricted,
@@ -1084,11 +1410,12 @@ app.post(
     if (conflict.rows[0]) throw new HttpError(409, 'Email already in use.');
 
     const code = sixDigitCode();
-    await redisSetWithTtl(
-      `change-email:${actor.id}`,
-      JSON.stringify({ newEmail, code }),
-      600
-    );
+    await saveEmailCode({
+      userId: actor.id,
+      purpose: 'change_email',
+      code,
+      targetEmail: newEmail,
+    });
     await sendCodeEmail(newEmail, 'Confirm your new Aura Social email', code);
 
     res.status(200).json({ ok: true, message: 'Confirmation code sent.' });
@@ -1103,17 +1430,15 @@ app.post(
     const code = sanitize(req.body.code);
     if (!code) throw new HttpError(400, 'Code is required.');
 
-    const raw = await redisGet(`change-email:${actor.id}`);
-    if (!raw) throw new HttpError(400, 'Code expired.');
-
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      throw new HttpError(400, 'Invalid email change payload.');
+    const verification = await consumeEmailCode({
+      userId: actor.id,
+      purpose: 'change_email',
+      code,
+    });
+    if (!verification.ok || !verification.targetEmail) {
+      if (verification.reason === 'expired') throw new HttpError(400, 'Code expired.');
+      throw new HttpError(400, 'Invalid confirmation code.');
     }
-
-    if (parsed.code !== code) throw new HttpError(400, 'Invalid confirmation code.');
 
     try {
       await pool.query(
@@ -1123,7 +1448,7 @@ app.post(
               updated_at = NOW()
           WHERE id = $2
         `,
-        [parsed.newEmail, actor.id]
+        [verification.targetEmail, actor.id]
       );
     } catch (error) {
       if (error && typeof error === 'object' && error.code === '23505') {
@@ -1131,8 +1456,6 @@ app.post(
       }
       throw error;
     }
-
-    await redisDel(`change-email:${actor.id}`);
 
     const user = await loadUserById(actor.id);
     res.status(200).json({ ok: true, user });
@@ -1148,21 +1471,43 @@ app.get(
     }
 
     const { limit, offset, page } = parsePagination(req);
-    const { rows } = await pool.query(
-      `
-        SELECT
-          p.id,
-          p.user_id AS "userId",
-          p.content,
-          p.created_at AS "createdAt",
-          u.id AS "authorId",
-          u.username AS "authorUsername",
-          u.display_name AS "authorDisplayName",
-          u.avatar_url AS "authorAvatarUrl"
-        FROM posts p
-        JOIN users u ON u.id = p.user_id
-        WHERE p.user_id = $1
-        ORDER BY p.created_at DESC
+	    const { rows } = await pool.query(
+	      `
+	        SELECT
+	          p.id,
+	          p.user_id AS "userId",
+	          p.content,
+	          p.created_at AS "createdAt",
+	          COALESCE(likes.user_ids, ARRAY[]::UUID[]) AS "likedBy",
+	          COALESCE(reposts.user_ids, ARRAY[]::UUID[]) AS "repostedBy",
+	          u.id AS "authorId",
+	          u.username AS "authorUsername",
+	          u.display_name AS "authorDisplayName",
+	          u.avatar_url AS "authorAvatarUrl",
+	          u.bio AS "authorBio",
+	          u.status AS "authorStatus",
+	          u.cover_image_url AS "authorCoverImage",
+	          u.hidden_from_friends AS "authorHiddenFromFriends",
+	          u.role AS "authorRole",
+	          u.banned AS "authorBanned",
+	          u.restricted AS "authorRestricted",
+	          u.is_verified AS "authorIsVerified",
+	          u.created_at AS "authorCreatedAt",
+	          u.updated_at AS "authorUpdatedAt"
+	        FROM posts p
+	        JOIN users u ON u.id = p.user_id
+	        LEFT JOIN LATERAL (
+	          SELECT array_agg(user_id)::UUID[] AS user_ids
+	          FROM post_likes
+	          WHERE post_id = p.id
+	        ) likes ON TRUE
+	        LEFT JOIN LATERAL (
+	          SELECT array_agg(user_id)::UUID[] AS user_ids
+	          FROM post_reposts
+	          WHERE post_id = p.id
+	        ) reposts ON TRUE
+	        WHERE p.user_id = $1
+	        ORDER BY p.created_at DESC
         LIMIT $2 OFFSET $3
       `,
       [req.params.id, limit, offset]
@@ -1196,11 +1541,23 @@ app.post(
 
     const post = {
       ...rows[0],
+      likedBy: [],
+      repostedBy: [],
       author: {
         id: actor.id,
         username: actor.username,
         displayName: actor.displayName,
         avatarUrl: actor.avatarUrl,
+        bio: actor.bio,
+        status: actor.status,
+        coverImage: actor.coverImage,
+        hiddenFromFriends: actor.hiddenFromFriends,
+        role: actor.role,
+        banned: actor.banned,
+        restricted: actor.restricted,
+        isVerified: actor.isVerified,
+        createdAt: actor.createdAt,
+        updatedAt: actor.updatedAt,
       },
     };
 
@@ -1227,24 +1584,111 @@ app.get(
       return;
     }
 
-    const { rows } = await pool.query(
-      `
-        SELECT
-          p.id,
-          p.user_id AS "userId",
-          p.content,
-          p.created_at AS "createdAt",
-          u.id AS "authorId",
-          u.username AS "authorUsername",
-          u.display_name AS "authorDisplayName",
-          u.avatar_url AS "authorAvatarUrl"
-        FROM posts p
-        JOIN users u ON u.id = p.user_id
-        ORDER BY p.created_at DESC
-        LIMIT $1 OFFSET $2
-      `,
+	    const { rows } = await pool.query(
+	      `
+	        SELECT
+	          p.id,
+	          p.user_id AS "userId",
+	          p.content,
+	          p.created_at AS "createdAt",
+	          COALESCE(likes.user_ids, ARRAY[]::UUID[]) AS "likedBy",
+	          COALESCE(reposts.user_ids, ARRAY[]::UUID[]) AS "repostedBy",
+	          u.id AS "authorId",
+	          u.username AS "authorUsername",
+	          u.display_name AS "authorDisplayName",
+	          u.avatar_url AS "authorAvatarUrl",
+	          u.bio AS "authorBio",
+	          u.status AS "authorStatus",
+	          u.cover_image_url AS "authorCoverImage",
+	          u.hidden_from_friends AS "authorHiddenFromFriends",
+	          u.role AS "authorRole",
+	          u.banned AS "authorBanned",
+	          u.restricted AS "authorRestricted",
+	          u.is_verified AS "authorIsVerified",
+	          u.created_at AS "authorCreatedAt",
+	          u.updated_at AS "authorUpdatedAt"
+	        FROM posts p
+	        JOIN users u ON u.id = p.user_id
+	        LEFT JOIN LATERAL (
+	          SELECT array_agg(user_id)::UUID[] AS user_ids
+	          FROM post_likes
+	          WHERE post_id = p.id
+	        ) likes ON TRUE
+	        LEFT JOIN LATERAL (
+	          SELECT array_agg(user_id)::UUID[] AS user_ids
+	          FROM post_reposts
+	          WHERE post_id = p.id
+	        ) reposts ON TRUE
+	        ORDER BY p.created_at DESC
+	        LIMIT $1 OFFSET $2
+	      `,
       [limit, offset]
     );
+
+    const postIds = rows.map((row) => row.id).filter(Boolean);
+
+    const commentRows = postIds.length
+      ? await pool.query(
+          `
+            SELECT
+              c.id,
+              c.post_id AS "postId",
+              c.author_id AS "authorId",
+              c.content AS text,
+              c.created_at AS "createdAt",
+              COALESCE(likes.user_ids, ARRAY[]::UUID[]) AS "likedBy"
+            FROM (
+              SELECT
+                pc.id,
+                pc.post_id,
+                pc.author_id,
+                pc.content,
+                pc.created_at,
+                ROW_NUMBER() OVER (PARTITION BY pc.post_id ORDER BY pc.created_at DESC) AS rn
+              FROM post_comments pc
+              WHERE pc.post_id = ANY($1::UUID[])
+            ) c
+            LEFT JOIN LATERAL (
+              SELECT array_agg(user_id)::UUID[] AS user_ids
+              FROM post_comment_likes
+              WHERE comment_id = c.id
+            ) likes ON TRUE
+            WHERE c.rn <= 10
+            ORDER BY c.created_at DESC
+          `,
+          [postIds]
+        )
+      : { rows: [] };
+
+    const commentUserIds = [
+      ...new Set((commentRows.rows || []).map((row) => row.authorId).filter(Boolean)),
+    ];
+    const users = commentUserIds.length
+      ? (
+          await pool.query(
+            `
+              SELECT
+                id,
+                username,
+                display_name AS "displayName",
+                avatar_url AS "avatarUrl",
+                bio,
+                status,
+                cover_image_url AS "coverImage",
+                hidden_from_friends AS "hiddenFromFriends",
+                role,
+                banned,
+                restricted,
+                is_verified AS "isVerified",
+                created_at AS "createdAt",
+                updated_at AS "updatedAt"
+              FROM users
+              WHERE id = ANY($1::UUID[])
+            `,
+            [commentUserIds]
+          )
+        ).rows
+      : [];
 
     const payload = {
       ok: true,
@@ -1252,10 +1696,328 @@ app.get(
       limit,
       offset,
       items: rows.map(mapPostRow),
+      comments: (commentRows.rows || []).map(mapPostCommentRow),
+      users,
     };
 
     await setCachedFeed(authUserId, page, limit, payload);
     res.status(200).json(payload);
+  })
+);
+
+app.post(
+  '/api/posts/:id/like',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    if (actor.restricted) throw new HttpError(403, 'Account is restricted.');
+    const postId = sanitize(req.params.id);
+    if (!isUUID(postId)) throw new HttpError(400, 'Invalid post id.');
+
+    const exists = await pool.query('SELECT id FROM posts WHERE id = $1 LIMIT 1', [postId]);
+    if (!exists.rows[0]) throw new HttpError(404, 'Post not found.');
+
+    const likedBy = await withTransaction(async (client) => {
+      const existing = await client.query(
+        'SELECT 1 FROM post_likes WHERE post_id = $1 AND user_id = $2 LIMIT 1',
+        [postId, actor.id]
+      );
+      if (existing.rows[0]) {
+        await client.query('DELETE FROM post_likes WHERE post_id = $1 AND user_id = $2', [
+          postId,
+          actor.id,
+        ]);
+      } else {
+        await client.query('INSERT INTO post_likes (post_id, user_id) VALUES ($1, $2)', [
+          postId,
+          actor.id,
+        ]);
+      }
+
+      const after = await client.query(
+        'SELECT COALESCE(array_agg(user_id)::UUID[], ARRAY[]::UUID[]) AS \"likedBy\" FROM post_likes WHERE post_id = $1',
+        [postId]
+      );
+      return normalizeUuidArray(after.rows[0]?.likedBy);
+    });
+
+    await invalidateFeedCacheForUsers([actor.id]);
+    res.status(200).json({ ok: true, likedBy });
+  })
+);
+
+app.post(
+  '/api/posts/:id/repost',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    if (actor.restricted) throw new HttpError(403, 'Account is restricted.');
+    const postId = sanitize(req.params.id);
+    if (!isUUID(postId)) throw new HttpError(400, 'Invalid post id.');
+
+    const exists = await pool.query('SELECT id FROM posts WHERE id = $1 LIMIT 1', [postId]);
+    if (!exists.rows[0]) throw new HttpError(404, 'Post not found.');
+
+    const repostedBy = await withTransaction(async (client) => {
+      const existing = await client.query(
+        'SELECT 1 FROM post_reposts WHERE post_id = $1 AND user_id = $2 LIMIT 1',
+        [postId, actor.id]
+      );
+      if (existing.rows[0]) {
+        await client.query('DELETE FROM post_reposts WHERE post_id = $1 AND user_id = $2', [
+          postId,
+          actor.id,
+        ]);
+      } else {
+        await client.query('INSERT INTO post_reposts (post_id, user_id) VALUES ($1, $2)', [
+          postId,
+          actor.id,
+        ]);
+      }
+
+      const after = await client.query(
+        'SELECT COALESCE(array_agg(user_id)::UUID[], ARRAY[]::UUID[]) AS \"repostedBy\" FROM post_reposts WHERE post_id = $1',
+        [postId]
+      );
+      return normalizeUuidArray(after.rows[0]?.repostedBy);
+    });
+
+    await invalidateFeedCacheForUsers([actor.id]);
+    res.status(200).json({ ok: true, repostedBy });
+  })
+);
+
+app.get(
+  '/api/posts/:id/comments',
+  asyncRoute(async (req, res) => {
+    const postId = sanitize(req.params.id);
+    if (!isUUID(postId)) throw new HttpError(400, 'Invalid post id.');
+    const { limit, offset, page } = parsePagination(req);
+
+    const exists = await pool.query('SELECT id FROM posts WHERE id = $1 LIMIT 1', [postId]);
+    if (!exists.rows[0]) throw new HttpError(404, 'Post not found.');
+
+    const { rows } = await pool.query(
+      `
+        SELECT
+          c.id,
+          c.post_id AS "postId",
+          c.author_id AS "authorId",
+          c.content AS text,
+          c.created_at AS "createdAt",
+          COALESCE(likes.user_ids, ARRAY[]::UUID[]) AS "likedBy"
+        FROM post_comments c
+        LEFT JOIN LATERAL (
+          SELECT array_agg(user_id)::UUID[] AS user_ids
+          FROM post_comment_likes
+          WHERE comment_id = c.id
+        ) likes ON TRUE
+        WHERE c.post_id = $1
+        ORDER BY c.created_at DESC
+        LIMIT $2 OFFSET $3
+      `,
+      [postId, limit, offset]
+    );
+
+    const userIds = [...new Set(rows.map((row) => row.authorId).filter(Boolean))];
+    const users = userIds.length
+      ? (
+          await pool.query(
+            `
+              SELECT
+                id,
+                username,
+                display_name AS "displayName",
+                avatar_url AS "avatarUrl",
+                bio,
+                status,
+                cover_image_url AS "coverImage",
+                hidden_from_friends AS "hiddenFromFriends",
+                role,
+                banned,
+                restricted,
+                is_verified AS "isVerified",
+                created_at AS "createdAt",
+                updated_at AS "updatedAt"
+              FROM users
+              WHERE id = ANY($1::UUID[])
+            `,
+            [userIds]
+          )
+        ).rows
+      : [];
+
+    res.status(200).json({
+      ok: true,
+      page,
+      limit,
+      offset,
+      items: rows.map(mapPostCommentRow),
+      users,
+    });
+  })
+);
+
+app.post(
+  '/api/posts/:id/comments',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    if (actor.restricted) throw new HttpError(403, 'Account is restricted.');
+    const postId = sanitize(req.params.id);
+    if (!isUUID(postId)) throw new HttpError(400, 'Invalid post id.');
+    const text = String(req.body.text || req.body.content || '').trim();
+    if (!text) throw new HttpError(400, 'Comment is required.');
+
+    const exists = await pool.query('SELECT id FROM posts WHERE id = $1 LIMIT 1', [postId]);
+    if (!exists.rows[0]) throw new HttpError(404, 'Post not found.');
+
+    const inserted = await pool.query(
+      `
+        INSERT INTO post_comments (post_id, author_id, content)
+        VALUES ($1, $2, $3)
+        RETURNING
+          id,
+          post_id AS "postId",
+          author_id AS "authorId",
+          content AS text,
+          created_at AS "createdAt"
+      `,
+      [postId, actor.id, text]
+    );
+
+    await invalidateFeedCacheForUsers([actor.id]);
+    res.status(201).json({
+      ok: true,
+      comment: mapPostCommentRow({ ...inserted.rows[0], likedBy: [] }),
+      users: [
+        {
+          id: actor.id,
+          username: actor.username,
+          displayName: actor.displayName,
+          avatarUrl: actor.avatarUrl,
+          bio: actor.bio,
+          status: actor.status,
+          coverImage: actor.coverImage,
+          hiddenFromFriends: actor.hiddenFromFriends,
+          role: actor.role,
+          banned: actor.banned,
+          restricted: actor.restricted,
+          isVerified: actor.isVerified,
+          createdAt: actor.createdAt,
+          updatedAt: actor.updatedAt,
+        },
+      ],
+    });
+  })
+);
+
+app.patch(
+  '/api/posts/comments/:id',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const commentId = sanitize(req.params.id);
+    if (!isUUID(commentId)) throw new HttpError(400, 'Invalid comment id.');
+    const text = String(req.body.text || req.body.content || '').trim();
+    if (!text) throw new HttpError(400, 'Comment is required.');
+
+    const { rows } = await pool.query(
+      'SELECT id, author_id AS \"authorId\" FROM post_comments WHERE id = $1 LIMIT 1',
+      [commentId]
+    );
+    const row = rows[0];
+    if (!row) throw new HttpError(404, 'Comment not found.');
+    if (actor.role !== 'admin' && row.authorId !== actor.id) throw new HttpError(403, 'Forbidden.');
+
+    const updated = await pool.query(
+      `
+        UPDATE post_comments
+        SET content = $1, updated_at = NOW()
+        WHERE id = $2
+        RETURNING
+          id,
+          post_id AS "postId",
+          author_id AS "authorId",
+          content AS text,
+          created_at AS "createdAt"
+      `,
+      [text, commentId]
+    );
+
+    const reactions = await pool.query(
+      'SELECT COALESCE(array_agg(user_id)::UUID[], ARRAY[]::UUID[]) AS \"likedBy\" FROM post_comment_likes WHERE comment_id = $1',
+      [commentId]
+    );
+
+    await invalidateFeedCacheForUsers([actor.id]);
+    res.status(200).json({
+      ok: true,
+      comment: mapPostCommentRow({ ...updated.rows[0], likedBy: reactions.rows[0]?.likedBy || [] }),
+    });
+  })
+);
+
+app.delete(
+  '/api/posts/comments/:id',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const commentId = sanitize(req.params.id);
+    if (!isUUID(commentId)) throw new HttpError(400, 'Invalid comment id.');
+
+    const { rows } = await pool.query(
+      'SELECT id, author_id AS \"authorId\" FROM post_comments WHERE id = $1 LIMIT 1',
+      [commentId]
+    );
+    const row = rows[0];
+    if (!row) throw new HttpError(404, 'Comment not found.');
+    if (actor.role !== 'admin' && row.authorId !== actor.id) throw new HttpError(403, 'Forbidden.');
+
+    await pool.query('DELETE FROM post_comments WHERE id = $1', [commentId]);
+    await invalidateFeedCacheForUsers([actor.id]);
+    res.status(200).json({ ok: true });
+  })
+);
+
+app.post(
+  '/api/posts/comments/:id/like',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    if (actor.restricted) throw new HttpError(403, 'Account is restricted.');
+    const commentId = sanitize(req.params.id);
+    if (!isUUID(commentId)) throw new HttpError(400, 'Invalid comment id.');
+
+    const exists = await pool.query('SELECT id FROM post_comments WHERE id = $1 LIMIT 1', [commentId]);
+    if (!exists.rows[0]) throw new HttpError(404, 'Comment not found.');
+
+    const likedBy = await withTransaction(async (client) => {
+      const existing = await client.query(
+        'SELECT 1 FROM post_comment_likes WHERE comment_id = $1 AND user_id = $2 LIMIT 1',
+        [commentId, actor.id]
+      );
+      if (existing.rows[0]) {
+        await client.query('DELETE FROM post_comment_likes WHERE comment_id = $1 AND user_id = $2', [
+          commentId,
+          actor.id,
+        ]);
+      } else {
+        await client.query('INSERT INTO post_comment_likes (comment_id, user_id) VALUES ($1, $2)', [
+          commentId,
+          actor.id,
+        ]);
+      }
+
+      const after = await client.query(
+        'SELECT COALESCE(array_agg(user_id)::UUID[], ARRAY[]::UUID[]) AS \"likedBy\" FROM post_comment_likes WHERE comment_id = $1',
+        [commentId]
+      );
+      return normalizeUuidArray(after.rows[0]?.likedBy);
+    });
+
+    await invalidateFeedCacheForUsers([actor.id]);
+    res.status(200).json({ ok: true, likedBy });
   })
 );
 
@@ -1369,6 +2131,922 @@ app.post(
   })
 );
 
+const groupAvatarUrl = (name) => {
+  const label = encodeURIComponent(String(name || 'Group').slice(0, 40));
+  return `https://ui-avatars.com/api/?name=${label}&background=0f172a&color=ffffff&size=256`;
+};
+
+const loadGroupById = async (groupId) => {
+  const { rows } = await pool.query(
+    `
+      SELECT
+        id,
+        name,
+        description,
+        admin_id AS "adminId",
+        allow_member_posts AS "allowMemberPosts",
+        avatar_url AS avatar,
+        cover_image_url AS "coverImage",
+        verified,
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM groups
+      WHERE id = $1
+      LIMIT 1
+    `,
+    [groupId]
+  );
+  return rows[0] || null;
+};
+
+const loadGroupMember = async (groupId, userId) => {
+  const { rows } = await pool.query(
+    `
+      SELECT
+        id,
+        group_id AS "groupId",
+        user_id AS "userId",
+        role,
+        created_at AS "createdAt"
+      FROM group_members
+      WHERE group_id = $1 AND user_id = $2
+      LIMIT 1
+    `,
+    [groupId, userId]
+  );
+  return rows[0] || null;
+};
+
+const isGroupAdmin = (actor, group, membership) =>
+  Boolean(
+    actor &&
+      group &&
+      (actor.role === 'admin' ||
+        group.adminId === actor.id ||
+        String(membership?.role || '') === 'admin')
+  );
+
+const loadUsersByIds = async (userIds) => {
+  const unique = [...new Set((userIds || []).filter(Boolean))];
+  if (!unique.length) return [];
+  const { rows } = await pool.query(
+    `
+      SELECT
+        id,
+        username,
+        display_name AS "displayName",
+        avatar_url AS "avatarUrl",
+        bio,
+        status,
+        cover_image_url AS "coverImage",
+        hidden_from_friends AS "hiddenFromFriends",
+        role,
+        banned,
+        restricted,
+        is_verified AS "isVerified",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM users
+      WHERE id = ANY($1::UUID[])
+    `,
+    [unique]
+  );
+  return rows;
+};
+
+app.get(
+  '/api/groups',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const { limit, offset, page } = parsePagination(req);
+    const query = sanitize(req.query.q || '').toLowerCase();
+
+    const { rows: groupRows } = query
+      ? await pool.query(
+          `
+            SELECT
+              id,
+              name,
+              description,
+              admin_id AS "adminId",
+              allow_member_posts AS "allowMemberPosts",
+              avatar_url AS avatar,
+              cover_image_url AS "coverImage",
+              verified,
+              created_at AS "createdAt",
+              updated_at AS "updatedAt"
+            FROM groups
+            WHERE LOWER(name) LIKE $1
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+          `,
+          [`%${query}%`, limit, offset]
+        )
+      : await pool.query(
+          `
+            SELECT
+              id,
+              name,
+              description,
+              admin_id AS "adminId",
+              allow_member_posts AS "allowMemberPosts",
+              avatar_url AS avatar,
+              cover_image_url AS "coverImage",
+              verified,
+              created_at AS "createdAt",
+              updated_at AS "updatedAt"
+            FROM groups
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+          `,
+          [limit, offset]
+        );
+
+    const groupIds = groupRows.map((row) => row.id).filter(Boolean);
+    const members = groupIds.length
+      ? await pool.query(
+          `
+            SELECT
+              id,
+              group_id AS "groupId",
+              user_id AS "userId",
+              role,
+              created_at AS "createdAt"
+            FROM group_members
+            WHERE group_id = ANY($1::UUID[])
+          `,
+          [groupIds]
+        )
+      : { rows: [] };
+
+    const userIds = [
+      ...groupRows.map((row) => row.adminId),
+      ...members.rows.map((row) => row.userId),
+    ];
+    const users = await loadUsersByIds(userIds);
+
+    res.status(200).json({
+      ok: true,
+      page,
+      limit,
+      offset,
+      groups: groupRows.map(mapGroupRow),
+      members: members.rows.map(mapGroupMemberRow),
+      users,
+    });
+  })
+);
+
+app.post(
+  '/api/groups',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    if (actor.restricted) throw new HttpError(403, 'Account is restricted.');
+    const name = sanitize(req.body.name);
+    const description = String(req.body.description || '');
+    const allowMemberPosts = req.body.allowMemberPosts !== undefined ? Boolean(req.body.allowMemberPosts) : true;
+
+    if (!name || name.length < 3 || name.length > 64) {
+      throw new HttpError(400, 'Group name must be 3-64 chars.');
+    }
+
+    const result = await withTransaction(async (client) => {
+      try {
+        const insertedGroup = await client.query(
+          `
+            INSERT INTO groups (
+              name,
+              description,
+              admin_id,
+              allow_member_posts,
+              avatar_url,
+              cover_image_url,
+              verified
+            )
+            VALUES ($1, $2, $3, $4, $5, '', FALSE)
+            RETURNING
+              id,
+              name,
+              description,
+              admin_id AS "adminId",
+              allow_member_posts AS "allowMemberPosts",
+              avatar_url AS avatar,
+              cover_image_url AS "coverImage",
+              verified,
+              created_at AS "createdAt",
+              updated_at AS "updatedAt"
+          `,
+          [name, description, actor.id, allowMemberPosts, groupAvatarUrl(name)]
+        );
+
+        const group = insertedGroup.rows[0];
+
+        const insertedMember = await client.query(
+          `
+            INSERT INTO group_members (group_id, user_id, role)
+            VALUES ($1, $2, 'admin')
+            RETURNING
+              id,
+              group_id AS "groupId",
+              user_id AS "userId",
+              role,
+              created_at AS "createdAt"
+          `,
+          [group.id, actor.id]
+        );
+
+        return { group, member: insertedMember.rows[0] };
+      } catch (error) {
+        if (error && typeof error === 'object' && error.code === '23505') {
+          throw new HttpError(409, 'Group name already exists.');
+        }
+        throw error;
+      }
+    });
+
+    res.status(201).json({
+      ok: true,
+      group: mapGroupRow(result.group),
+      member: mapGroupMemberRow(result.member),
+      users: await loadUsersByIds([result.group.adminId]),
+    });
+  })
+);
+
+app.get(
+  '/api/groups/:id',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const groupId = sanitize(req.params.id);
+    if (!isUUID(groupId)) throw new HttpError(400, 'Invalid group id.');
+
+    const group = await loadGroupById(groupId);
+    if (!group) throw new HttpError(404, 'Group not found.');
+
+    const membership = await loadGroupMember(groupId, actor.id);
+
+    const { limit, offset, page } = parsePagination(req);
+    const { rows: memberRows } = await pool.query(
+      `
+        SELECT
+          id,
+          group_id AS "groupId",
+          user_id AS "userId",
+          role,
+          created_at AS "createdAt"
+        FROM group_members
+        WHERE group_id = $1
+        ORDER BY created_at ASC
+      `,
+      [groupId]
+    );
+
+    const { rows: postRows } = await pool.query(
+      `
+        SELECT
+          gp.id,
+          gp.group_id AS "groupId",
+          gp.author_id AS "authorId",
+          gp.content AS text,
+          gp.media_type AS "mediaType",
+          gp.media_url AS "mediaUrl",
+          gp.repost_of_post_id AS "repostOfPostId",
+          gp.created_at AS "createdAt",
+          COALESCE(likes.user_ids, ARRAY[]::UUID[]) AS "likedBy",
+          COALESCE(reposts.user_ids, ARRAY[]::UUID[]) AS "repostedBy"
+        FROM group_posts gp
+        LEFT JOIN LATERAL (
+          SELECT array_agg(user_id)::UUID[] AS user_ids
+          FROM group_post_likes
+          WHERE group_post_id = gp.id
+        ) likes ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT array_agg(user_id)::UUID[] AS user_ids
+          FROM group_post_reposts
+          WHERE group_post_id = gp.id
+        ) reposts ON TRUE
+        WHERE gp.group_id = $1
+        ORDER BY gp.created_at DESC
+        LIMIT $2 OFFSET $3
+      `,
+      [groupId, limit, offset]
+    );
+
+    const postIds = postRows.map((row) => row.id).filter(Boolean);
+    const commentRows = postIds.length
+      ? await pool.query(
+          `
+            SELECT
+              c.id,
+              c.group_post_id AS "groupPostId",
+              c.author_id AS "authorId",
+              c.content AS text,
+              c.created_at AS "createdAt",
+              COALESCE(likes.user_ids, ARRAY[]::UUID[]) AS "likedBy"
+            FROM group_post_comments c
+            LEFT JOIN LATERAL (
+              SELECT array_agg(user_id)::UUID[] AS user_ids
+              FROM group_post_comment_likes
+              WHERE group_post_comment_id = c.id
+            ) likes ON TRUE
+            WHERE c.group_post_id = ANY($1::UUID[])
+            ORDER BY c.created_at ASC
+          `,
+          [postIds]
+        )
+      : { rows: [] };
+
+    const userIds = [
+      group.adminId,
+      ...memberRows.map((row) => row.userId),
+      ...postRows.map((row) => row.authorId),
+      ...commentRows.rows.map((row) => row.authorId),
+    ];
+
+    res.status(200).json({
+      ok: true,
+      page,
+      limit,
+      offset,
+      group: mapGroupRow(group),
+      membership: membership ? mapGroupMemberRow(membership) : null,
+      members: memberRows.map(mapGroupMemberRow),
+      posts: postRows.map(mapGroupPostRow),
+      comments: commentRows.rows.map(mapGroupCommentRow),
+      users: await loadUsersByIds(userIds),
+    });
+  })
+);
+
+app.patch(
+  '/api/groups/:id',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const groupId = sanitize(req.params.id);
+    if (!isUUID(groupId)) throw new HttpError(400, 'Invalid group id.');
+
+    const group = await loadGroupById(groupId);
+    if (!group) throw new HttpError(404, 'Group not found.');
+    const membership = await loadGroupMember(groupId, actor.id);
+    if (!isGroupAdmin(actor, group, membership)) throw new HttpError(403, 'Forbidden.');
+
+    const name = req.body.name !== undefined ? sanitize(req.body.name) : null;
+    const description = req.body.description !== undefined ? String(req.body.description || '') : null;
+    const avatar = req.body.avatar !== undefined ? sanitize(req.body.avatar) : null;
+    const coverImage = req.body.coverImage !== undefined ? sanitize(req.body.coverImage) : null;
+    const allowMemberPosts = req.body.allowMemberPosts !== undefined ? Boolean(req.body.allowMemberPosts) : null;
+    const verified = req.body.verified !== undefined ? Boolean(req.body.verified) : null;
+
+    const updates = [];
+    const values = [];
+    let index = 1;
+
+    if (name !== null) {
+      if (!name || name.length < 3 || name.length > 64) throw new HttpError(400, 'Group name must be 3-64 chars.');
+      updates.push(`name = $${index}`);
+      values.push(name);
+      index += 1;
+    }
+    if (description !== null) {
+      updates.push(`description = $${index}`);
+      values.push(description);
+      index += 1;
+    }
+    if (avatar !== null) {
+      updates.push(`avatar_url = $${index}`);
+      values.push(avatar || groupAvatarUrl(name || group.name));
+      index += 1;
+    }
+    if (coverImage !== null) {
+      updates.push(`cover_image_url = $${index}`);
+      values.push(coverImage || '');
+      index += 1;
+    }
+    if (allowMemberPosts !== null) {
+      updates.push(`allow_member_posts = $${index}`);
+      values.push(allowMemberPosts);
+      index += 1;
+    }
+    if (verified !== null) {
+      if (actor.role !== 'admin') throw new HttpError(403, 'Admin access required to set verified.');
+      updates.push(`verified = $${index}`);
+      values.push(verified);
+      index += 1;
+    }
+
+    if (!updates.length) throw new HttpError(400, 'Nothing to update.');
+
+    values.push(groupId);
+
+    let updated;
+    try {
+      const { rows } = await pool.query(
+        `
+          UPDATE groups
+          SET ${updates.join(', ')}, updated_at = NOW()
+          WHERE id = $${index}
+          RETURNING
+            id,
+            name,
+            description,
+            admin_id AS "adminId",
+            allow_member_posts AS "allowMemberPosts",
+            avatar_url AS avatar,
+            cover_image_url AS "coverImage",
+            verified,
+            created_at AS "createdAt",
+            updated_at AS "updatedAt"
+        `,
+        values
+      );
+      updated = rows[0] || null;
+    } catch (error) {
+      if (error && typeof error === 'object' && error.code === '23505') {
+        throw new HttpError(409, 'Group name already exists.');
+      }
+      throw error;
+    }
+
+    if (!updated) throw new HttpError(404, 'Group not found.');
+    res.status(200).json({ ok: true, group: mapGroupRow(updated) });
+  })
+);
+
+app.post(
+  '/api/groups/:id/subscribe',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const groupId = sanitize(req.params.id);
+    if (!isUUID(groupId)) throw new HttpError(400, 'Invalid group id.');
+    const group = await loadGroupById(groupId);
+    if (!group) throw new HttpError(404, 'Group not found.');
+
+    const role = group.adminId === actor.id ? 'admin' : 'member';
+    const { rows } = await pool.query(
+      `
+        INSERT INTO group_members (group_id, user_id, role)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (group_id, user_id)
+        DO UPDATE SET role = EXCLUDED.role
+        RETURNING
+          id,
+          group_id AS "groupId",
+          user_id AS "userId",
+          role,
+          created_at AS "createdAt"
+      `,
+      [groupId, actor.id, role]
+    );
+
+    res.status(200).json({ ok: true, member: mapGroupMemberRow(rows[0]) });
+  })
+);
+
+app.delete(
+  '/api/groups/:id/subscribe',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const groupId = sanitize(req.params.id);
+    if (!isUUID(groupId)) throw new HttpError(400, 'Invalid group id.');
+    const group = await loadGroupById(groupId);
+    if (!group) throw new HttpError(404, 'Group not found.');
+    if (group.adminId === actor.id) throw new HttpError(400, 'Group owner cannot unsubscribe.');
+
+    await pool.query('DELETE FROM group_members WHERE group_id = $1 AND user_id = $2', [groupId, actor.id]);
+    res.status(200).json({ ok: true });
+  })
+);
+
+app.post(
+  '/api/groups/:id/posts',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    if (actor.restricted) throw new HttpError(403, 'Account is restricted.');
+    const groupId = sanitize(req.params.id);
+    if (!isUUID(groupId)) throw new HttpError(400, 'Invalid group id.');
+    const content = String(req.body.content || req.body.text || '').trim();
+    const mediaTypeRaw = req.body.mediaType !== undefined ? sanitize(req.body.mediaType).toLowerCase() : '';
+    const mediaType = mediaTypeRaw === 'image' || mediaTypeRaw === 'video' ? mediaTypeRaw : null;
+    const mediaUrl = req.body.mediaUrl !== undefined ? sanitize(req.body.mediaUrl) : null;
+    const repostOfPostId = req.body.repostOfPostId !== undefined ? sanitize(req.body.repostOfPostId) : null;
+
+    if (!content && !mediaUrl) throw new HttpError(400, 'Post content is required.');
+
+    const group = await loadGroupById(groupId);
+    if (!group) throw new HttpError(404, 'Group not found.');
+
+    const membership = await loadGroupMember(groupId, actor.id);
+    const admin = isGroupAdmin(actor, group, membership);
+    const canPost =
+      admin ||
+      (membership && (group.allowMemberPosts || String(membership.role || '') === 'admin'));
+    if (!canPost) throw new HttpError(403, 'You cannot publish in this group.');
+
+    const inserted = await pool.query(
+      `
+        INSERT INTO group_posts (group_id, author_id, content, media_type, media_url, repost_of_post_id)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING
+          id,
+          group_id AS "groupId",
+          author_id AS "authorId",
+          content AS text,
+          media_type AS "mediaType",
+          media_url AS "mediaUrl",
+          repost_of_post_id AS "repostOfPostId",
+          created_at AS "createdAt"
+      `,
+      [groupId, actor.id, content, mediaType, mediaUrl, repostOfPostId || null]
+    );
+
+    await pool.query('UPDATE groups SET updated_at = NOW() WHERE id = $1', [groupId]);
+
+    const post = mapGroupPostRow({
+      ...inserted.rows[0],
+      likedBy: [],
+      repostedBy: [],
+    });
+    res.status(201).json({ ok: true, post });
+  })
+);
+
+app.patch(
+  '/api/groups/posts/:id',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const postId = sanitize(req.params.id);
+    if (!isUUID(postId)) throw new HttpError(400, 'Invalid post id.');
+    const content = String(req.body.content || req.body.text || '').trim();
+    if (!content) throw new HttpError(400, 'Post content is required.');
+
+    const { rows } = await pool.query(
+      `
+        SELECT
+          gp.id,
+          gp.group_id AS "groupId",
+          gp.author_id AS "authorId",
+          g.admin_id AS "groupAdminId"
+        FROM group_posts gp
+        JOIN groups g ON g.id = gp.group_id
+        WHERE gp.id = $1
+        LIMIT 1
+      `,
+      [postId]
+    );
+    const row = rows[0];
+    if (!row) throw new HttpError(404, 'Post not found.');
+    const membership = await loadGroupMember(row.groupId, actor.id);
+    const admin = actor.role === 'admin' || row.groupAdminId === actor.id || String(membership?.role || '') === 'admin';
+    if (!admin && row.authorId !== actor.id) throw new HttpError(403, 'Forbidden.');
+
+    const updated = await pool.query(
+      `
+        UPDATE group_posts
+        SET content = $1, updated_at = NOW()
+        WHERE id = $2
+        RETURNING
+          id,
+          group_id AS "groupId",
+          author_id AS "authorId",
+          content AS text,
+          media_type AS "mediaType",
+          media_url AS "mediaUrl",
+          repost_of_post_id AS "repostOfPostId",
+          created_at AS "createdAt"
+      `,
+      [content, postId]
+    );
+
+    const reactions = await pool.query(
+      `
+        SELECT
+          ARRAY(SELECT user_id FROM group_post_likes WHERE group_post_id = $1) AS "likedBy",
+          ARRAY(SELECT user_id FROM group_post_reposts WHERE group_post_id = $1) AS "repostedBy"
+      `,
+      [postId]
+    );
+
+    const post = mapGroupPostRow({
+      ...updated.rows[0],
+      likedBy: reactions.rows[0]?.likedBy || [],
+      repostedBy: reactions.rows[0]?.repostedBy || [],
+    });
+    res.status(200).json({ ok: true, post });
+  })
+);
+
+app.delete(
+  '/api/groups/posts/:id',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const postId = sanitize(req.params.id);
+    if (!isUUID(postId)) throw new HttpError(400, 'Invalid post id.');
+
+    const { rows } = await pool.query(
+      `
+        SELECT
+          gp.id,
+          gp.group_id AS "groupId",
+          gp.author_id AS "authorId",
+          g.admin_id AS "groupAdminId"
+        FROM group_posts gp
+        JOIN groups g ON g.id = gp.group_id
+        WHERE gp.id = $1
+        LIMIT 1
+      `,
+      [postId]
+    );
+    const row = rows[0];
+    if (!row) throw new HttpError(404, 'Post not found.');
+    const membership = await loadGroupMember(row.groupId, actor.id);
+    const admin = actor.role === 'admin' || row.groupAdminId === actor.id || String(membership?.role || '') === 'admin';
+    if (!admin && row.authorId !== actor.id) throw new HttpError(403, 'Forbidden.');
+
+    await pool.query('DELETE FROM group_posts WHERE id = $1', [postId]);
+    await pool.query('UPDATE groups SET updated_at = NOW() WHERE id = $1', [row.groupId]);
+    res.status(200).json({ ok: true });
+  })
+);
+
+app.post(
+  '/api/groups/posts/:id/comments',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const postId = sanitize(req.params.id);
+    if (!isUUID(postId)) throw new HttpError(400, 'Invalid post id.');
+    const text = String(req.body.text || req.body.content || '').trim();
+    if (!text) throw new HttpError(400, 'Comment is required.');
+
+    const { rows } = await pool.query(
+      'SELECT group_id AS \"groupId\" FROM group_posts WHERE id = $1 LIMIT 1',
+      [postId]
+    );
+    const groupId = rows[0]?.groupId || null;
+    if (!groupId) throw new HttpError(404, 'Post not found.');
+    const membership = await loadGroupMember(groupId, actor.id);
+    if (!membership && actor.role !== 'admin') throw new HttpError(403, 'Join the group to comment.');
+
+    const inserted = await pool.query(
+      `
+        INSERT INTO group_post_comments (group_post_id, author_id, content)
+        VALUES ($1, $2, $3)
+        RETURNING
+          id,
+          group_post_id AS "groupPostId",
+          author_id AS "authorId",
+          content AS text,
+          created_at AS "createdAt"
+      `,
+      [postId, actor.id, text]
+    );
+
+    res.status(201).json({ ok: true, comment: mapGroupCommentRow({ ...inserted.rows[0], likedBy: [] }) });
+  })
+);
+
+app.patch(
+  '/api/groups/comments/:id',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const commentId = sanitize(req.params.id);
+    if (!isUUID(commentId)) throw new HttpError(400, 'Invalid comment id.');
+    const text = String(req.body.text || req.body.content || '').trim();
+    if (!text) throw new HttpError(400, 'Comment is required.');
+
+    const { rows } = await pool.query(
+      `
+        SELECT
+          c.id,
+          c.group_post_id AS "groupPostId",
+          c.author_id AS "authorId",
+          p.group_id AS "groupId",
+          g.admin_id AS "groupAdminId"
+        FROM group_post_comments c
+        JOIN group_posts p ON p.id = c.group_post_id
+        JOIN groups g ON g.id = p.group_id
+        WHERE c.id = $1
+        LIMIT 1
+      `,
+      [commentId]
+    );
+    const row = rows[0];
+    if (!row) throw new HttpError(404, 'Comment not found.');
+    const membership = await loadGroupMember(row.groupId, actor.id);
+    const admin = actor.role === 'admin' || row.groupAdminId === actor.id || String(membership?.role || '') === 'admin';
+    if (!admin && row.authorId !== actor.id) throw new HttpError(403, 'Forbidden.');
+
+    const updated = await pool.query(
+      `
+        UPDATE group_post_comments
+        SET content = $1, updated_at = NOW()
+        WHERE id = $2
+        RETURNING
+          id,
+          group_post_id AS "groupPostId",
+          author_id AS "authorId",
+          content AS text,
+          created_at AS "createdAt"
+      `,
+      [text, commentId]
+    );
+    const reactions = await pool.query(
+      `
+        SELECT ARRAY(SELECT user_id FROM group_post_comment_likes WHERE comment_id = $1) AS "likedBy"
+      `,
+      [commentId]
+    );
+    res.status(200).json({
+      ok: true,
+      comment: mapGroupCommentRow({ ...updated.rows[0], likedBy: reactions.rows[0]?.likedBy || [] }),
+    });
+  })
+);
+
+app.delete(
+  '/api/groups/comments/:id',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const commentId = sanitize(req.params.id);
+    if (!isUUID(commentId)) throw new HttpError(400, 'Invalid comment id.');
+
+    const { rows } = await pool.query(
+      `
+        SELECT
+          c.id,
+          c.author_id AS "authorId",
+          p.group_id AS "groupId",
+          g.admin_id AS "groupAdminId"
+        FROM group_post_comments c
+        JOIN group_posts p ON p.id = c.group_post_id
+        JOIN groups g ON g.id = p.group_id
+        WHERE c.id = $1
+        LIMIT 1
+      `,
+      [commentId]
+    );
+    const row = rows[0];
+    if (!row) throw new HttpError(404, 'Comment not found.');
+    const membership = await loadGroupMember(row.groupId, actor.id);
+    const admin = actor.role === 'admin' || row.groupAdminId === actor.id || String(membership?.role || '') === 'admin';
+    if (!admin && row.authorId !== actor.id) throw new HttpError(403, 'Forbidden.');
+
+    await pool.query('DELETE FROM group_post_comments WHERE id = $1', [commentId]);
+    res.status(200).json({ ok: true });
+  })
+);
+
+app.post(
+  '/api/groups/posts/:id/like',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const postId = sanitize(req.params.id);
+    if (!isUUID(postId)) throw new HttpError(400, 'Invalid post id.');
+
+    const { rows } = await pool.query(
+      'SELECT group_id AS \"groupId\" FROM group_posts WHERE id = $1 LIMIT 1',
+      [postId]
+    );
+    const groupId = rows[0]?.groupId || null;
+    if (!groupId) throw new HttpError(404, 'Post not found.');
+    const membership = await loadGroupMember(groupId, actor.id);
+    if (!membership && actor.role !== 'admin') throw new HttpError(403, 'Join the group to like posts.');
+
+    const likedBy = await withTransaction(async (client) => {
+      const existing = await client.query(
+        'SELECT 1 FROM group_post_likes WHERE group_post_id = $1 AND user_id = $2 LIMIT 1',
+        [postId, actor.id]
+      );
+      if (existing.rows[0]) {
+        await client.query('DELETE FROM group_post_likes WHERE group_post_id = $1 AND user_id = $2', [
+          postId,
+          actor.id,
+        ]);
+      } else {
+        await client.query('INSERT INTO group_post_likes (group_post_id, user_id) VALUES ($1, $2)', [
+          postId,
+          actor.id,
+        ]);
+      }
+
+      const after = await client.query(
+        'SELECT COALESCE(array_agg(user_id)::UUID[], ARRAY[]::UUID[]) AS \"likedBy\" FROM group_post_likes WHERE group_post_id = $1',
+        [postId]
+      );
+      return normalizeUuidArray(after.rows[0]?.likedBy);
+    });
+
+    res.status(200).json({ ok: true, likedBy });
+  })
+);
+
+app.post(
+  '/api/groups/posts/:id/repost',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const postId = sanitize(req.params.id);
+    if (!isUUID(postId)) throw new HttpError(400, 'Invalid post id.');
+
+    const { rows } = await pool.query(
+      'SELECT group_id AS \"groupId\" FROM group_posts WHERE id = $1 LIMIT 1',
+      [postId]
+    );
+    const groupId = rows[0]?.groupId || null;
+    if (!groupId) throw new HttpError(404, 'Post not found.');
+    const membership = await loadGroupMember(groupId, actor.id);
+    if (!membership && actor.role !== 'admin') throw new HttpError(403, 'Join the group to repost.');
+
+    const repostedBy = await withTransaction(async (client) => {
+      const existing = await client.query(
+        'SELECT 1 FROM group_post_reposts WHERE group_post_id = $1 AND user_id = $2 LIMIT 1',
+        [postId, actor.id]
+      );
+      if (existing.rows[0]) {
+        await client.query('DELETE FROM group_post_reposts WHERE group_post_id = $1 AND user_id = $2', [
+          postId,
+          actor.id,
+        ]);
+      } else {
+        await client.query('INSERT INTO group_post_reposts (group_post_id, user_id) VALUES ($1, $2)', [
+          postId,
+          actor.id,
+        ]);
+      }
+
+      const after = await client.query(
+        'SELECT COALESCE(array_agg(user_id)::UUID[], ARRAY[]::UUID[]) AS \"repostedBy\" FROM group_post_reposts WHERE group_post_id = $1',
+        [postId]
+      );
+      return normalizeUuidArray(after.rows[0]?.repostedBy);
+    });
+
+    res.status(200).json({ ok: true, repostedBy });
+  })
+);
+
+app.post(
+  '/api/groups/comments/:id/like',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const actor = req.user;
+    const commentId = sanitize(req.params.id);
+    if (!isUUID(commentId)) throw new HttpError(400, 'Invalid comment id.');
+
+    const { rows } = await pool.query(
+      `
+        SELECT p.group_id AS "groupId"
+        FROM group_post_comments c
+        JOIN group_posts p ON p.id = c.group_post_id
+        WHERE c.id = $1
+        LIMIT 1
+      `,
+      [commentId]
+    );
+    const groupId = rows[0]?.groupId || null;
+    if (!groupId) throw new HttpError(404, 'Comment not found.');
+    const membership = await loadGroupMember(groupId, actor.id);
+    if (!membership && actor.role !== 'admin') throw new HttpError(403, 'Join the group to like comments.');
+
+    const likedBy = await withTransaction(async (client) => {
+      const existing = await client.query(
+        'SELECT 1 FROM group_post_comment_likes WHERE comment_id = $1 AND user_id = $2 LIMIT 1',
+        [commentId, actor.id]
+      );
+      if (existing.rows[0]) {
+        await client.query(
+          'DELETE FROM group_post_comment_likes WHERE comment_id = $1 AND user_id = $2',
+          [commentId, actor.id]
+        );
+      } else {
+        await client.query(
+          'INSERT INTO group_post_comment_likes (comment_id, user_id) VALUES ($1, $2)',
+          [commentId, actor.id]
+        );
+      }
+
+      const after = await client.query(
+        'SELECT COALESCE(array_agg(user_id)::UUID[], ARRAY[]::UUID[]) AS \"likedBy\" FROM group_post_comment_likes WHERE comment_id = $1',
+        [commentId]
+      );
+      return normalizeUuidArray(after.rows[0]?.likedBy);
+    });
+
+    res.status(200).json({ ok: true, likedBy });
+  })
+);
+
 app.post(
   '/api/messages',
   requireAuth,
@@ -1411,7 +3089,7 @@ app.post(
     });
 
     await invalidateChatsCacheForUsers([actor.id, receiverId]);
-    wsBroadcastMessage(message);
+    await wsBroadcastMessage(message);
     res.status(201).json({ ok: true, message });
   })
 );
@@ -1501,37 +3179,55 @@ app.get(
       return;
     }
 
-    const { rows } = await pool.query(
-      `
-        SELECT
-          d.id,
-          d.kind,
-          d.created_at AS "createdAt",
-          d.updated_at AS "updatedAt",
-          peer.id AS "peerId",
-          peer.username AS "peerUsername",
-          peer.display_name AS "peerDisplayName",
-          peer.avatar_url AS "peerAvatarUrl",
-          peer.is_verified AS "peerIsVerified",
-          COALESCE(unread.count, 0) AS "unreadCount",
-          last_message.id AS "lastMessageId",
-          last_message.sender_id AS "lastMessageSenderId",
-          last_message.receiver_id AS "lastMessageReceiverId",
-          last_message.content AS "lastMessageContent",
-          last_message.created_at AS "lastMessageCreatedAt"
-        FROM dialog_members dm
-        JOIN dialogs d ON d.id = dm.dialog_id
-        LEFT JOIN LATERAL (
-          SELECT
-            u.id,
-            u.username,
-            u.display_name,
-            u.avatar_url,
-            u.is_verified
-          FROM users u
-          WHERE u.id = CASE WHEN d.direct_user_a = $1 THEN d.direct_user_b ELSE d.direct_user_a END
-          LIMIT 1
-        ) peer ON TRUE
+	    const { rows } = await pool.query(
+	      `
+	        SELECT
+	          d.id,
+	          d.kind,
+	          d.created_at AS "createdAt",
+	          d.updated_at AS "updatedAt",
+	          peer.id AS "peerId",
+	          peer.username AS "peerUsername",
+	          peer.display_name AS "peerDisplayName",
+	          peer.avatar_url AS "peerAvatarUrl",
+	          peer.is_verified AS "peerIsVerified",
+	          peer.bio AS "peerBio",
+	          peer.status AS "peerStatus",
+	          peer.cover_image_url AS "peerCoverImage",
+	          peer.hidden_from_friends AS "peerHiddenFromFriends",
+	          peer.role AS "peerRole",
+	          peer.banned AS "peerBanned",
+	          peer.restricted AS "peerRestricted",
+	          peer.created_at AS "peerCreatedAt",
+	          peer.updated_at AS "peerUpdatedAt",
+	          COALESCE(unread.count, 0) AS "unreadCount",
+	          last_message.id AS "lastMessageId",
+	          last_message.sender_id AS "lastMessageSenderId",
+	          last_message.receiver_id AS "lastMessageReceiverId",
+	          last_message.content AS "lastMessageContent",
+	          last_message.created_at AS "lastMessageCreatedAt"
+	        FROM dialog_members dm
+	        JOIN dialogs d ON d.id = dm.dialog_id
+	        LEFT JOIN LATERAL (
+	          SELECT
+	            u.id,
+	            u.username,
+	            u.display_name,
+	            u.avatar_url,
+	            u.bio,
+	            u.status,
+	            u.cover_image_url,
+	            u.hidden_from_friends,
+	            u.role,
+	            u.banned,
+	            u.restricted,
+	            u.is_verified,
+	            u.created_at,
+	            u.updated_at
+	          FROM users u
+	          WHERE u.id = CASE WHEN d.direct_user_a = $1 THEN d.direct_user_b ELSE d.direct_user_a END
+	          LIMIT 1
+	        ) peer ON TRUE
         LEFT JOIN LATERAL (
           SELECT
             m.id,
@@ -1569,26 +3265,29 @@ app.get(
   requireAuth,
   requireAdmin,
   asyncRoute(async (_req, res) => {
-    const { rows } = await pool.query(
-      `
-        SELECT
-          id,
-          username,
-          email,
-          display_name AS "displayName",
-          avatar_url AS "avatarUrl",
-          bio,
-          role,
-          banned,
-          restricted,
-          is_verified AS "isVerified",
-          email_verification_required AS "emailVerificationRequired",
-          created_at AS "createdAt",
-          updated_at AS "updatedAt"
-        FROM users
-        ORDER BY created_at DESC
-      `
-    );
+	    const { rows } = await pool.query(
+	      `
+	        SELECT
+	          id,
+	          username,
+	          email,
+	          display_name AS "displayName",
+	          avatar_url AS "avatarUrl",
+	          bio,
+	          status,
+	          cover_image_url AS "coverImage",
+	          hidden_from_friends AS "hiddenFromFriends",
+	          role,
+	          banned,
+	          restricted,
+	          is_verified AS "isVerified",
+	          email_verification_required AS "emailVerificationRequired",
+	          created_at AS "createdAt",
+	          updated_at AS "updatedAt"
+	        FROM users
+	        ORDER BY created_at DESC
+	      `
+	    );
 
     res.status(200).json({ ok: true, items: rows });
   })
@@ -1827,6 +3526,17 @@ const shutdown = async () => {
   wss.clients.forEach((socket) => socket.close());
   await new Promise((resolve) => server.close(resolve));
 
+  if (redisPubSubReady || redisSubscriber.isOpen) {
+    try {
+      if (redisPubSubReady) {
+        await redisSubscriber.unsubscribe(WS_MESSAGE_CHANNEL);
+      }
+      await redisSubscriber.quit();
+    } catch {
+      // ignore redis subscriber shutdown errors
+    }
+  }
+
   if (redisReady) {
     try {
       await redis.quit();
@@ -1840,14 +3550,32 @@ const shutdown = async () => {
 };
 
 const start = async () => {
-  await ensureDatabaseSchema();
-  await ensureBootstrapAdmin();
+  await ensureDatabaseReady();
 
   try {
     await redis.connect();
     redisReady = true;
+    try {
+      await redisSubscriber.connect();
+      await redisSubscriber.subscribe(WS_MESSAGE_CHANNEL, (raw) => {
+        try {
+          const message = JSON.parse(String(raw));
+          wsBroadcastLocalMessage(message);
+        } catch {
+          // ignore malformed payload from pub/sub channel
+        }
+      });
+      redisPubSubReady = true;
+    } catch {
+      redisPubSubReady = false;
+      if (nodeEnv !== 'production') {
+        // eslint-disable-next-line no-console
+        console.warn('Redis pub/sub is unavailable. WebSocket fan-out is local-only.');
+      }
+    }
   } catch {
     redisReady = false;
+    redisPubSubReady = false;
     if (nodeEnv !== 'production') {
       // eslint-disable-next-line no-console
       console.warn('Redis is unavailable. Running without cache-backed features.');

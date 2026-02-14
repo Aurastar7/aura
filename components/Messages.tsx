@@ -56,6 +56,30 @@ const Messages: React.FC<MessagesProps> = ({
   } | null>(null);
   const onMarkChatReadRef = useRef(onMarkChatRead);
   const conversationRef = useRef<HTMLDivElement | null>(null);
+  const conversationBottomRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
+  const initialScrollPendingRef = useRef(false);
+
+  const scrollConversationToBottom = (behavior: ScrollBehavior) => {
+    const container = conversationRef.current;
+    if (container) {
+      const top = Math.max(0, container.scrollHeight - container.clientHeight);
+      if (behavior === 'smooth') {
+        try {
+          container.scrollTo({ top, behavior: 'smooth' });
+        } catch {
+          container.scrollTop = top;
+        }
+      } else {
+        container.scrollTop = top;
+      }
+      return;
+    }
+
+    const node = conversationBottomRef.current;
+    if (!node) return;
+    requestAnimationFrame(() => node.scrollIntoView({ behavior, block: 'end' }));
+  };
 
   useEffect(() => {
     onMarkChatReadRef.current = onMarkChatRead;
@@ -124,13 +148,51 @@ const Messages: React.FC<MessagesProps> = ({
   }, [activeChatUserId, conversation.length]);
 
   useEffect(() => {
-    if (!activeChatUserId) return;
+    if (!activeChatUserId) return undefined;
+    // Ensure we scroll to the latest message once the dialog content is loaded.
+    initialScrollPendingRef.current = true;
+    stickToBottomRef.current = true;
+
+    requestAnimationFrame(() => scrollConversationToBottom('auto'));
+    const timer = window.setTimeout(() => scrollConversationToBottom('auto'), 180);
+    return () => window.clearTimeout(timer);
+  }, [activeChatUserId]);
+
+  useEffect(() => {
     const container = conversationRef.current;
-    if (!container) return;
+    if (!container) return undefined;
+
+    const updateStickiness = () => {
+      const distance = container.scrollHeight - container.scrollTop - container.clientHeight;
+      stickToBottomRef.current = distance < 120;
+    };
+
+    updateStickiness();
+    container.addEventListener('scroll', updateStickiness, { passive: true });
+    return () => container.removeEventListener('scroll', updateStickiness);
+  }, [activeChatUserId]);
+
+  useEffect(() => {
+    if (!activeChatUserId) return;
+    const last = conversation[conversation.length - 1];
+    const isMine = last?.fromId === currentUser.id;
+    const shouldScroll = initialScrollPendingRef.current || isMine || stickToBottomRef.current;
+    const behavior: ScrollBehavior = initialScrollPendingRef.current ? 'auto' : 'smooth';
+
+    if (!shouldScroll) return;
+    initialScrollPendingRef.current = false;
     requestAnimationFrame(() => {
-      container.scrollTop = container.scrollHeight;
+      scrollConversationToBottom(behavior);
+      stickToBottomRef.current = true;
     });
-  }, [activeChatUserId, conversation.length]);
+
+    const timer = window.setTimeout(() => {
+      if (isMine || stickToBottomRef.current) {
+        scrollConversationToBottom('auto');
+      }
+    }, 240);
+    return () => window.clearTimeout(timer);
+  }, [activeChatUserId, messages]);
 
   const resetDraft = () => {
     setText('');
@@ -253,121 +315,124 @@ const Messages: React.FC<MessagesProps> = ({
         </button>
       </div>
 
-      <div ref={conversationRef} className="flex-1 min-h-0 px-4 py-4 space-y-2 overflow-y-auto">
-        {conversation.length > 0 ? (
-          conversation.map((message) => {
-            const isMine = message.fromId === currentUser.id;
-            const isEditing = editingMessageId === message.id;
-            const canEdit = isMine && message.mediaType !== 'voice';
+      <div ref={conversationRef} className="flex-1 min-h-0 px-4 py-4 overflow-y-auto flex flex-col">
+        <div className="mt-auto flex flex-col gap-2">
+          {conversation.length > 0 ? (
+            conversation.map((message) => {
+              const isMine = message.fromId === currentUser.id;
+              const isEditing = editingMessageId === message.id;
+              const canEdit = isMine && message.mediaType !== 'voice';
 
-            return (
-              <div key={message.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
-                <div
-                  className={`max-w-[82%] rounded-2xl px-3 py-2 text-sm ${
-                    isMine
-                      ? 'bg-slate-900 text-white dark:bg-white dark:text-black'
-                      : 'bg-slate-100 dark:bg-slate-900'
-                  }`}
-                >
-                  {message.mediaType === 'voice' && message.mediaUrl ? (
-                    <audio controls src={message.mediaUrl} className="w-full mb-2" />
-                  ) : message.mediaUrl ? (
-                    isVideoUrl(message.mediaUrl) ? (
-                      <button
-                        type="button"
-                        className="block w-full mb-2"
-                        onClick={() =>
-                          setMediaPreview({
-                            url: message.mediaUrl || '',
-                            isVideo: true,
-                            zoom: 1,
-                            fit: 'contain',
-                          })
-                        }
-                      >
-                        <video src={message.mediaUrl} className="rounded-xl max-h-56 w-full object-cover" />
-                      </button>
+              return (
+                <div key={message.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
+                  <div
+                    className={`max-w-[82%] rounded-2xl px-3 py-2 text-sm ${
+                      isMine
+                        ? 'bg-slate-900 text-white dark:bg-white dark:text-black'
+                        : 'bg-slate-100 dark:bg-slate-900'
+                    }`}
+                  >
+                    {message.mediaType === 'voice' && message.mediaUrl ? (
+                      <audio controls src={message.mediaUrl} className="w-full mb-2" />
+                    ) : message.mediaUrl ? (
+                      isVideoUrl(message.mediaUrl) ? (
+                        <button
+                          type="button"
+                          className="block w-full mb-2"
+                          onClick={() =>
+                            setMediaPreview({
+                              url: message.mediaUrl || '',
+                              isVideo: true,
+                              zoom: 1,
+                              fit: 'contain',
+                            })
+                          }
+                        >
+                          <video src={message.mediaUrl} className="rounded-xl max-h-56 w-full object-cover" />
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="block w-full mb-2"
+                          onClick={() =>
+                            setMediaPreview({
+                              url: message.mediaUrl || '',
+                              isVideo: false,
+                              zoom: 1,
+                              fit: 'contain',
+                            })
+                          }
+                        >
+                          <img src={message.mediaUrl} alt="message media" className="rounded-xl max-h-56 w-full object-cover" />
+                        </button>
+                      )
+                    ) : null}
+
+                    {isEditing ? (
+                      <div className="space-y-2">
+                        <input
+                          value={editingText}
+                          onChange={(event) => setEditingText(event.target.value)}
+                          className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-2 py-1 text-xs"
+                        />
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => {
+                              onEditMessage(message.id, editingText);
+                              setEditingMessageId(null);
+                              setEditingText('');
+                            }}
+                            className="text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 px-2 py-0.5"
+                          >
+                            Save
+                          </button>
+                          <button
+                            onClick={() => {
+                              setEditingMessageId(null);
+                              setEditingText('');
+                            }}
+                            className="text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 px-2 py-0.5"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
                     ) : (
-                      <button
-                        type="button"
-                        className="block w-full mb-2"
-                        onClick={() =>
-                          setMediaPreview({
-                            url: message.mediaUrl || '',
-                            isVideo: false,
-                            zoom: 1,
-                            fit: 'contain',
-                          })
-                        }
-                      >
-                        <img src={message.mediaUrl} alt="message media" className="rounded-xl max-h-56 w-full object-cover" />
-                      </button>
-                    )
-                  ) : null}
+                      <p>{message.text}</p>
+                    )}
 
-                  {isEditing ? (
-                    <div className="space-y-2">
-                      <input
-                        value={editingText}
-                        onChange={(event) => setEditingText(event.target.value)}
-                        className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-2 py-1 text-xs"
-                      />
-                      <div className="flex gap-2">
+                    <div className="text-[10px] opacity-70 mt-1 flex items-center justify-between gap-2">
+                      <span>{new Date(message.createdAt).toLocaleTimeString()}</span>
+                      <span>{message.editedAt ? 'edited' : ''}</span>
+                    </div>
+                    {canEdit && !isEditing ? (
+                      <div className="mt-1 flex gap-1.5">
                         <button
                           onClick={() => {
-                            onEditMessage(message.id, editingText);
-                            setEditingMessageId(null);
-                            setEditingText('');
+                            setEditingMessageId(message.id);
+                            setEditingText(message.text);
                           }}
-                          className="text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 px-2 py-0.5"
+                          className="text-[11px] rounded-lg border border-current/30 px-2 py-0.5"
                         >
-                          Save
+                          Edit
                         </button>
                         <button
-                          onClick={() => {
-                            setEditingMessageId(null);
-                            setEditingText('');
-                          }}
-                          className="text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 px-2 py-0.5"
+                          onClick={() => onDeleteMessage(message.id)}
+                          className="text-[11px] rounded-lg border border-current/30 px-2 py-0.5"
                         >
-                          Cancel
+                          Delete
                         </button>
                       </div>
-                    </div>
-                  ) : (
-                    <p>{message.text}</p>
-                  )}
-
-                  <div className="text-[10px] opacity-70 mt-1 flex items-center justify-between gap-2">
-                    <span>{new Date(message.createdAt).toLocaleTimeString()}</span>
-                    <span>{message.editedAt ? 'edited' : ''}</span>
+                    ) : null}
                   </div>
-                  {canEdit && !isEditing ? (
-                    <div className="mt-1 flex gap-1.5">
-                      <button
-                        onClick={() => {
-                          setEditingMessageId(message.id);
-                          setEditingText(message.text);
-                        }}
-                        className="text-[11px] rounded-lg border border-current/30 px-2 py-0.5"
-                      >
-                        Edit
-                      </button>
-                      <button
-                        onClick={() => onDeleteMessage(message.id)}
-                        className="text-[11px] rounded-lg border border-current/30 px-2 py-0.5"
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  ) : null}
                 </div>
-              </div>
-            );
-          })
-        ) : (
-          <p className="text-sm text-slate-500">No messages in this conversation.</p>
-        )}
+              );
+            })
+          ) : (
+            <p className="text-sm text-slate-500">No messages in this conversation.</p>
+          )}
+          <div ref={conversationBottomRef} />
+        </div>
       </div>
 
       <form onSubmit={submit} className="shrink-0 px-4 py-3 border-t border-slate-200 dark:border-slate-800 space-y-2">
@@ -423,7 +488,7 @@ const Messages: React.FC<MessagesProps> = ({
   );
 
   return (
-    <div className="pb-[calc(env(safe-area-inset-bottom)+72px)] lg:pb-6 h-[calc(var(--app-height)-56px)] lg:h-[var(--app-height)] flex flex-col overflow-hidden">
+    <div className="h-[calc(var(--app-height)-env(safe-area-inset-top)-env(safe-area-inset-bottom)-56px-72px)] lg:h-[var(--app-height)] flex flex-col overflow-hidden">
       <header className="px-6 py-4 border-b-2 border-slate-200 dark:border-slate-800">
         <h1 className="text-2xl font-bold">Messages</h1>
       </header>

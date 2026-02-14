@@ -7,6 +7,7 @@ export type AppView =
   | 'messages'
   | 'profile'
   | 'groups'
+  | 'settings'
   | 'admin';
 
 export type MediaType = 'image' | 'video';

@@ -1,0 +1,109 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-aura_social}
+      POSTGRES_USER: ${PGUSER:-aura_user}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-change_me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-aura_user} -d ${PGDATABASE:-aura_social}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  nats:
+    image: nats:2.10-alpine
+    restart: unless-stopped
+    command: ["-js", "-m", "8222"]
+    # Monitoring is bound to localhost by default for safety.
+    ports:
+      - "127.0.0.1:8222:8222"
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio123456}
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - minio_data:/data
+    # MinIO API/console bound to localhost by default.
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      SYNC_PORT: 3001
+
+      # Backend security / auth
+      JWT_SECRET: ${JWT_SECRET:-change-this-to-a-long-random-secret}
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+
+      # Database
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${PGDATABASE:-aura_social}
+      PGUSER: ${PGUSER:-aura_user}
+      PGPASSWORD: ${PGPASSWORD:-change_me}
+      DATABASE_URL: ${DATABASE_URL:-}
+
+      # Cache / pubsub
+      REDIS_URL: redis://redis:6379
+      REDIS_WS_CHANNEL: ${REDIS_WS_CHANNEL:-aura:ws:message}
+
+      # App tuning
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      RATE_LIMIT_GLOBAL_MAX: ${RATE_LIMIT_GLOBAL_MAX:-100}
+      RATE_LIMIT_AUTH_MAX: ${RATE_LIMIT_AUTH_MAX:-5}
+      EMAIL_VERIFICATION_REQUIRED: ${EMAIL_VERIFICATION_REQUIRED:-false}
+
+      BOOTSTRAP_ADMIN_ENABLED: ${BOOTSTRAP_ADMIN_ENABLED:-true}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-313}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-313}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-313@aura.local}
+      BOOTSTRAP_ADMIN_DISPLAY_NAME: ${BOOTSTRAP_ADMIN_DISPLAY_NAME:-Aura Admin}
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        VITE_API_URL: ${VITE_API_URL:-}
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "${WEB_PORT:-8080}:80"
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

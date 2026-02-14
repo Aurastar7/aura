@@ -10,8 +10,7 @@ interface AuthScreenProps {
     password: string
   ) => Promise<ActionResult> | ActionResult;
   onVerify: (code: string) => Promise<ActionResult> | ActionResult;
-  darkMode: boolean;
-  onToggleTheme: () => void;
+  onResendCode: () => Promise<ActionResult> | ActionResult;
 }
 
 const CODE_LENGTH = 6;
@@ -20,8 +19,7 @@ const AuthScreen: React.FC<AuthScreenProps> = ({
   onLogin,
   onRegister,
   onVerify,
-  darkMode,
-  onToggleTheme,
+  onResendCode,
 }) => {
   const [mode, setMode] = useState<'login' | 'register' | 'verify'>('login');
   const [username, setUsername] = useState('');
@@ -31,9 +29,25 @@ const AuthScreen: React.FC<AuthScreenProps> = ({
   const [digits, setDigits] = useState(Array.from({ length: CODE_LENGTH }, () => ''));
   const [message, setMessage] = useState<ActionResult | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [resending, setResending] = useState(false);
+  const [resendCooldown, setResendCooldown] = useState(0);
   const digitRefs = useRef<Array<HTMLInputElement | null>>([]);
 
   const verificationCode = useMemo(() => digits.join('').trim(), [digits]);
+
+  React.useEffect(() => {
+    if (resendCooldown <= 0) return undefined;
+    const timer = window.setInterval(() => {
+      setResendCooldown((value) => Math.max(value - 1, 0));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [resendCooldown]);
+
+  const openVerifyMode = () => {
+    setMode('verify');
+    setPassword('');
+    setTimeout(() => digitRefs.current[0]?.focus(), 0);
+  };
 
   const submitAuth = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -46,14 +60,10 @@ const AuthScreen: React.FC<AuthScreenProps> = ({
     setSubmitting(false);
 
     setMessage(result);
-    if (!result.ok) return;
-
-    if (mode === 'register') {
-      setMode('verify');
-      setPassword('');
-      setTimeout(() => digitRefs.current[0]?.focus(), 0);
-      return;
+    if (result.requiresVerification) {
+      openVerifyMode();
     }
+    if (!result.ok) return;
 
     setPassword('');
   };
@@ -64,6 +74,17 @@ const AuthScreen: React.FC<AuthScreenProps> = ({
     const result = await Promise.resolve(onVerify(verificationCode));
     setSubmitting(false);
     setMessage(result);
+  };
+
+  const resendCode = async () => {
+    if (resending || resendCooldown > 0) return;
+    setResending(true);
+    const result = await Promise.resolve(onResendCode());
+    setResending(false);
+    setMessage(result);
+    if (result.ok) {
+      setResendCooldown(30);
+    }
   };
 
   const updateDigit = (index: number, value: string) => {
@@ -87,18 +108,11 @@ const AuthScreen: React.FC<AuthScreenProps> = ({
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-black text-slate-900 dark:text-white flex items-center justify-center px-4 py-12 transition-colors">
-      <button
-        onClick={onToggleTheme}
-        className="absolute top-4 right-4 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-black px-3 py-2 text-sm font-semibold"
-      >
-        {darkMode ? 'Light mode' : 'Dark mode'}
-      </button>
-
       <div className="w-full max-w-xl rounded-3xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-black p-6 md:p-8 shadow-sm">
         <p className="text-xs uppercase tracking-[0.24em] text-slate-500 dark:text-slate-300 font-semibold">Aura Social</p>
         <h1 className="mt-2 text-3xl font-black">Welcome</h1>
         <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-          Secure sign in with email verification.
+          Sign in or create an account.
         </p>
 
         {mode !== 'verify' ? (
@@ -225,6 +239,19 @@ const AuthScreen: React.FC<AuthScreenProps> = ({
               className="w-full rounded-xl py-2 border border-slate-300 dark:border-slate-700"
             >
               Back to login
+            </button>
+
+            <button
+              type="button"
+              onClick={resendCode}
+              disabled={resending || resendCooldown > 0}
+              className="w-full rounded-xl py-2 border border-slate-300 dark:border-slate-700 disabled:opacity-60"
+            >
+              {resending
+                ? 'Sending...'
+                : resendCooldown > 0
+                  ? `Resend in ${resendCooldown}s`
+                  : 'Resend code'}
             </button>
           </form>
         )}

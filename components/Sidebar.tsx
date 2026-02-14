@@ -59,7 +59,7 @@ const Sidebar: React.FC<SidebarProps> = ({
               key={item.id}
               onClick={() => onChangeView(item.id)}
               className={`flex items-center gap-4 w-full p-3 rounded-2xl transition-all ${
-                currentView === item.id
+                currentView === item.id || (currentView === 'settings' && item.id === 'profile')
                   ? 'bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-white'
                   : 'hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300'
               }`}
@@ -96,6 +96,18 @@ const Sidebar: React.FC<SidebarProps> = ({
             <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" /></svg>
           )}
           <span className="font-medium">{darkMode ? 'Light mode' : 'Dark mode'}</span>
+        </button>
+
+        <button
+          onClick={() => onChangeView('settings')}
+          className={`flex items-center gap-4 w-full p-3 rounded-2xl transition-all ${
+            currentView === 'settings'
+              ? 'bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-white'
+              : 'hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300'
+          }`}
+        >
+          <ICONS.Settings className="w-6 h-6" />
+          <span className="font-medium">Settings</span>
         </button>
 
         <button

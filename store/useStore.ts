@@ -77,6 +77,7 @@ type UseStore = {
   activeGroupId: string | null;
   register: (payload: RegisterPayload) => Promise<ActionResult>;
   verifyPending: (code: string) => Promise<ActionResult>;
+  resendVerificationCode: () => Promise<ActionResult>;
   login: (payload: LoginPayload) => Promise<ActionResult>;
   logout: () => void;
   setTheme: (theme: ThemeMode) => void;
@@ -104,6 +105,9 @@ type UseStore = {
   markChatRead: (chatUserId: string) => void;
   markNotificationsRead: () => void;
   updateProfile: (patch: ProfilePatch) => ActionResult;
+  changePassword: (currentPassword: string, newPassword: string) => Promise<ActionResult>;
+  requestEmailChange: (newEmail: string) => Promise<ActionResult>;
+  confirmEmailChange: (code: string) => Promise<ActionResult>;
   createGroup: (payload: GroupPayload) => ActionResult;
   updateGroup: (groupId: string, patch: GroupPatch) => ActionResult;
   toggleGroupSubscription: (groupId: string) => ActionResult;
@@ -137,9 +141,28 @@ type UseStore = {
 const ok = (message: string): ActionResult => ({ ok: true, message });
 const fail = (message: string): ActionResult => ({ ok: false, message });
 
+class ApiRequestError extends Error {
+  status: number;
+  data: any;
+
+  constructor(message: string, status: number, data: any) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.status = status;
+    this.data = data;
+  }
+}
+
 const toUser = (raw: any): User => {
-  const createdAt = raw?.createdAt || raw?.created_at || nowIso();
-  const updatedAt = raw?.updatedAt || raw?.updated_at || createdAt;
+  const createdAt = String(raw?.createdAt || raw?.created_at || nowIso());
+  // Treat missing timestamps as "very old" so partial payloads cannot overwrite fresh local state.
+  const updatedAt = String(
+    raw?.updatedAt ||
+      raw?.updated_at ||
+      raw?.createdAt ||
+      raw?.created_at ||
+      '1970-01-01T00:00:00.000Z'
+  );
   const displayName = raw?.displayName || raw?.display_name || raw?.username || 'User';
   const avatar = raw?.avatarUrl || raw?.avatar_url || '';
   const rawRole = String(raw?.role || 'user');
@@ -155,12 +178,12 @@ const toUser = (raw: any): User => {
     bio: String(raw?.bio || ''),
     status: String(raw?.status || ''),
     avatar,
-    coverImage: String(raw?.coverImage || ''),
+    coverImage: String(raw?.coverImage ?? raw?.cover_image_url ?? raw?.cover_image ?? ''),
     role,
     banned: Boolean(raw?.banned),
     restricted: Boolean(raw?.restricted),
     verified: Boolean(raw?.isVerified || raw?.verified),
-    hiddenFromFriends: Boolean(raw?.hiddenFromFriends),
+    hiddenFromFriends: Boolean(raw?.hiddenFromFriends ?? raw?.hidden_from_friends),
     createdAt,
     updatedAt,
     lastSeenAt: String(raw?.lastSeenAt || nowIso()),
@@ -179,6 +202,15 @@ const toPost = (raw: any): Post => ({
   repostOfPostId: raw?.repostOfPostId,
   repostOfGroupPostId: raw?.repostOfGroupPostId,
   repostSourceGroupId: raw?.repostSourceGroupId,
+});
+
+const toPostComment = (raw: any): PostComment => ({
+  id: String(raw?.id || ''),
+  postId: String(raw?.postId || raw?.post_id || ''),
+  authorId: String(raw?.authorId || raw?.author_id || ''),
+  text: String(raw?.text || raw?.content || ''),
+  likedBy: Array.isArray(raw?.likedBy) ? raw.likedBy.map(String) : [],
+  createdAt: String(raw?.createdAt || raw?.created_at || nowIso()),
 });
 
 const toMessage = (raw: any, me: string): Message => {
@@ -205,6 +237,53 @@ const toMessage = (raw: any, me: string): Message => {
     createdAt,
   };
 };
+
+const toGroup = (raw: any): Group => {
+  const createdAt = String(raw?.createdAt || raw?.created_at || nowIso());
+  const updatedAt = String(raw?.updatedAt || raw?.updated_at || createdAt);
+  return {
+    id: String(raw?.id || ''),
+    name: String(raw?.name || ''),
+    description: String(raw?.description || ''),
+    adminId: String(raw?.adminId || raw?.admin_id || ''),
+    allowMemberPosts: Boolean(raw?.allowMemberPosts ?? raw?.allow_member_posts),
+    avatar: String(raw?.avatar || raw?.avatarUrl || raw?.avatar_url || ''),
+    coverImage: String(raw?.coverImage || raw?.cover_image_url || ''),
+    verified: Boolean(raw?.verified),
+    createdAt,
+    updatedAt,
+  };
+};
+
+const toGroupMember = (raw: any): GroupMember => ({
+  id: String(raw?.id || ''),
+  groupId: String(raw?.groupId || raw?.group_id || ''),
+  userId: String(raw?.userId || raw?.user_id || ''),
+  role: raw?.role === 'admin' ? 'admin' : 'member',
+  createdAt: String(raw?.createdAt || raw?.created_at || nowIso()),
+});
+
+const toGroupPost = (raw: any): GroupPost => ({
+  id: String(raw?.id || ''),
+  groupId: String(raw?.groupId || raw?.group_id || ''),
+  authorId: String(raw?.authorId || raw?.author_id || ''),
+  text: String(raw?.text || raw?.content || ''),
+  mediaType: raw?.mediaType === 'video' ? 'video' : raw?.mediaType === 'image' ? 'image' : undefined,
+  mediaUrl: raw?.mediaUrl ? String(raw.mediaUrl) : undefined,
+  createdAt: String(raw?.createdAt || raw?.created_at || nowIso()),
+  likedBy: Array.isArray(raw?.likedBy) ? raw.likedBy.map(String) : [],
+  repostedBy: Array.isArray(raw?.repostedBy) ? raw.repostedBy.map(String) : [],
+  repostOfPostId: raw?.repostOfPostId ? String(raw.repostOfPostId) : undefined,
+});
+
+const toGroupPostComment = (raw: any): GroupPostComment => ({
+  id: String(raw?.id || ''),
+  groupPostId: String(raw?.groupPostId || raw?.group_post_id || ''),
+  authorId: String(raw?.authorId || raw?.author_id || ''),
+  text: String(raw?.text || raw?.content || ''),
+  likedBy: Array.isArray(raw?.likedBy) ? raw.likedBy.map(String) : [],
+  createdAt: String(raw?.createdAt || raw?.created_at || nowIso()),
+});
 
 const isWsOpen = (ws: WebSocket | null) => ws?.readyState === WebSocket.OPEN;
 
@@ -291,7 +370,11 @@ export function useStore(): UseStore {
 
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(String(data?.message || `Request failed (${response.status})`));
+        throw new ApiRequestError(
+          String(data?.message || `Request failed (${response.status})`),
+          response.status,
+          data
+        );
       }
 
       return data;
@@ -306,7 +389,18 @@ export function useStore(): UseStore {
       incoming.forEach((item) => {
         if (!item.id) return;
         const current = map.get(item.id);
-        map.set(item.id, current ? { ...current, ...item } : item);
+        if (!current) {
+          map.set(item.id, item);
+          return;
+        }
+
+        const currentUpdatedAt = Date.parse(String(current.updatedAt || ''));
+        const incomingUpdatedAt = Date.parse(String(item.updatedAt || ''));
+        const currentTs = Number.isFinite(currentUpdatedAt) ? currentUpdatedAt : 0;
+        const incomingTs = Number.isFinite(incomingUpdatedAt) ? incomingUpdatedAt : 0;
+
+        // Prefer the fresher record when fields conflict; still keep any unknown keys from both.
+        map.set(item.id, incomingTs >= currentTs ? { ...current, ...item } : { ...item, ...current });
       });
       return { ...prev, users: Array.from(map.values()) };
     });
@@ -335,19 +429,28 @@ export function useStore(): UseStore {
 
   const fetchFeed = useCallback(async () => {
     try {
-      const payload = await apiRequest('/api/posts/feed?limit=50&offset=0', {}, false);
+      const payload = await apiRequest('/api/posts/feed?limit=50&offset=0', {}, Boolean(token));
       const nextPosts = (payload.items || []).map(toPost);
       const authorUsers = (payload.items || [])
         .map((item: any) => item.author)
         .filter(Boolean)
         .map((raw: any) => toUser({ ...raw, isVerified: Boolean(raw?.isVerified || raw?.verified) }));
+      const extraUsers = Array.isArray(payload.users) ? payload.users.map(toUser) : [];
+      const nextComments = Array.isArray(payload.comments) ? payload.comments.map(toPostComment) : [];
 
-      mergeUsers(authorUsers);
-      setDb((prev) => ({ ...prev, posts: nextPosts }));
+      mergeUsers([...authorUsers, ...extraUsers]);
+      setDb((prev) => {
+        const postIds = new Set(nextPosts.map((post) => post.id).filter(Boolean));
+        const optimistic = prev.postComments.filter(
+          (comment) => postIds.has(comment.postId) && String(comment.id || '').startsWith('tmp-')
+        );
+        const keep = prev.postComments.filter((comment) => !postIds.has(comment.postId));
+        return { ...prev, posts: nextPosts, postComments: [...keep, ...nextComments, ...optimistic] };
+      });
     } catch {
       // keep current data
     }
-  }, [apiRequest, mergeUsers]);
+  }, [apiRequest, mergeUsers, token]);
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -368,6 +471,71 @@ export function useStore(): UseStore {
       // keep current follows
     }
   }, [apiRequest, token]);
+
+  const fetchGroups = useCallback(async () => {
+    if (!token) return;
+    try {
+      const payload = await apiRequest('/api/groups?limit=50&offset=0', {}, true);
+      const nextGroups = Array.isArray(payload.groups) ? payload.groups.map(toGroup) : [];
+      const nextMembers = Array.isArray(payload.members) ? payload.members.map(toGroupMember) : [];
+      const usersFromPayload = Array.isArray(payload.users) ? payload.users.map(toUser) : [];
+      mergeUsers(usersFromPayload);
+
+      setDb((prev) => ({
+        ...prev,
+        groups: nextGroups,
+        groupMembers: nextMembers,
+      }));
+    } catch {
+      // keep current groups
+    }
+  }, [apiRequest, mergeUsers, token]);
+
+  const fetchGroup = useCallback(
+    async (groupId: string) => {
+      if (!token || !groupId) return;
+      try {
+        const payload = await apiRequest(`/api/groups/${encodeURIComponent(groupId)}?limit=50&offset=0`, {}, true);
+        const group = payload.group ? toGroup(payload.group) : null;
+        const members = Array.isArray(payload.members) ? payload.members.map(toGroupMember) : [];
+        const posts = Array.isArray(payload.posts) ? payload.posts.map(toGroupPost) : [];
+        const comments = Array.isArray(payload.comments) ? payload.comments.map(toGroupPostComment) : [];
+        const usersFromPayload = Array.isArray(payload.users) ? payload.users.map(toUser) : [];
+        mergeUsers(usersFromPayload);
+
+        setDb((prev) => {
+          const nextGroups = group
+            ? [group, ...prev.groups.filter((candidate) => candidate.id !== group.id)]
+            : prev.groups;
+
+          const nextMembers = [
+            ...prev.groupMembers.filter((item) => item.groupId !== groupId),
+            ...members,
+          ];
+
+          const removedPostIds = new Set(
+            prev.groupPosts.filter((item) => item.groupId === groupId).map((item) => item.id)
+          );
+          const nextPosts = [...prev.groupPosts.filter((item) => item.groupId !== groupId), ...posts];
+          const nextComments = [
+            ...prev.groupPostComments.filter((item) => !removedPostIds.has(item.groupPostId)),
+            ...comments,
+          ];
+
+          return {
+            ...prev,
+            groups: nextGroups,
+            groupMembers: nextMembers,
+            groupPosts: nextPosts,
+            groupPostComments: nextComments,
+          };
+        });
+      } catch {
+        // keep current group data
+      }
+    },
+    [apiRequest, mergeUsers, token]
+  );
 
   const fetchMessagesWith = useCallback(
     async (otherUserId: string) => {
@@ -391,6 +559,33 @@ export function useStore(): UseStore {
     },
     [apiRequest, token, db.session.userId]
   );
+
+  const fetchChats = useCallback(async () => {
+    if (!token || !db.session.userId) return;
+    try {
+      const payload = await apiRequest('/api/chats?limit=50&offset=0', {}, true);
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      const peerUsers = items
+        .map((item: any) => item.peer)
+        .filter(Boolean)
+        .map((raw: any) => toUser({ ...raw, isVerified: Boolean(raw?.isVerified || raw?.verified) }));
+
+      mergeUsers(peerUsers);
+
+      setDb((prev) => {
+        const knownIds = new Set(prev.messages.map((message) => message.id));
+        const seeded = items
+          .map((item: any) => item.lastMessage)
+          .filter((item: any) => item && item.id && !knownIds.has(String(item.id)))
+          .map((item: any) => toMessage(item, prev.session.userId || ''));
+
+        if (!seeded.length) return prev;
+        return { ...prev, messages: [...prev.messages, ...seeded] };
+      });
+    } catch {
+      // keep current chats
+    }
+  }, [apiRequest, db.session.userId, mergeUsers, token]);
 
   const closeSocket = useCallback(() => {
     if (wsTimerRef.current) {
@@ -469,6 +664,12 @@ export function useStore(): UseStore {
   }, [db.theme]);
 
   useEffect(() => {
+    if (typeof document === 'undefined') return;
+    const root = document.documentElement;
+    root.classList.toggle('dark', db.theme === 'dark');
+  }, [db.theme]);
+
+  useEffect(() => {
     if (typeof window === 'undefined') return;
     if (pendingVerificationUserId) {
       localStorage.setItem(PENDING_VERIFY_USER_KEY, pendingVerificationUserId);
@@ -483,12 +684,31 @@ export function useStore(): UseStore {
     void fetchFeed();
     void fetchUsers();
     void fetchFollows();
-  }, [token, hydrateMe, fetchFeed, fetchUsers, fetchFollows]);
+    void fetchChats();
+    void fetchGroups();
+  }, [token, hydrateMe, fetchFeed, fetchUsers, fetchFollows, fetchChats, fetchGroups]);
 
   useEffect(() => {
     if (!activeChatUserId) return;
     void fetchMessagesWith(activeChatUserId);
   }, [activeChatUserId, fetchMessagesWith]);
+
+  useEffect(() => {
+    if (!token) return;
+    if (!db.session.activeGroupId) return;
+    void fetchGroup(db.session.activeGroupId);
+  }, [db.session.activeGroupId, fetchGroup, token]);
+
+  useEffect(() => {
+    if (!token) return;
+    const timer = window.setInterval(() => {
+      void fetchChats();
+      if (activeChatUserId) {
+        void fetchMessagesWith(activeChatUserId);
+      }
+    }, 20000);
+    return () => window.clearInterval(timer);
+  }, [activeChatUserId, fetchChats, fetchMessagesWith, token]);
 
   const register = async (payload: RegisterPayload): Promise<ActionResult> => {
     const username = String(payload.username || '').trim().toLowerCase();
@@ -510,7 +730,11 @@ export function useStore(): UseStore {
 
       if (data.requiresVerification && data.userId) {
         setPendingVerificationUserId(String(data.userId));
-        return ok('Account created. Enter the code from your email.');
+        return {
+          ok: true,
+          message: 'Account created. Enter the code from your email.',
+          requiresVerification: true,
+        };
       }
 
       if (data.token && data.user) {
@@ -536,7 +760,7 @@ export function useStore(): UseStore {
   const verifyPending = async (code: string): Promise<ActionResult> => {
     const trimmed = String(code || '').trim();
     if (!pendingVerificationUserId) return fail('No pending verification.');
-    if (trimmed.length < 4) return fail('Enter verification code.');
+    if (trimmed.length !== 6) return fail('Enter 6-digit verification code.');
 
     try {
       const data = await apiRequest(
@@ -566,6 +790,23 @@ export function useStore(): UseStore {
       return fail('Verification response is invalid.');
     } catch (error: any) {
       return fail(String(error?.message || 'Verification failed.'));
+    }
+  };
+
+  const resendVerificationCode = async (): Promise<ActionResult> => {
+    if (!pendingVerificationUserId) return fail('No pending verification.');
+    try {
+      await apiRequest(
+        '/api/auth/resend-verification',
+        {
+          method: 'POST',
+          body: JSON.stringify({ userId: pendingVerificationUserId }),
+        },
+        false
+      );
+      return ok('A new verification code has been sent to your email.');
+    } catch (error: any) {
+      return fail(String(error?.message || 'Failed to resend verification code.'));
     }
   };
 
@@ -600,6 +841,19 @@ export function useStore(): UseStore {
 
       return fail('Login response is invalid.');
     } catch (error: any) {
+      if (
+        error instanceof ApiRequestError &&
+        error.status === 403 &&
+        Boolean(error.data?.requiresVerification) &&
+        error.data?.userId
+      ) {
+        setPendingVerificationUserId(String(error.data.userId));
+        return {
+          ok: false,
+          message: String(error?.message || 'Email not verified.'),
+          requiresVerification: true,
+        };
+      }
       return fail(String(error?.message || 'Login failed.'));
     }
   };
@@ -687,42 +941,81 @@ export function useStore(): UseStore {
 
   const togglePostLike = (postId: string): ActionResult => {
     if (!user) return fail('Unauthorized.');
+    if (!token) return fail('Unauthorized.');
+    const existing = db.posts.find((post) => post.id === postId);
+    if (!existing) return fail('Post not found.');
+
+    const liked = existing.likedBy.includes(user.id);
+    const optimisticLikedBy = liked
+      ? existing.likedBy.filter((id) => id !== user.id)
+      : [...existing.likedBy, user.id];
+
     setDb((prev) => ({
       ...prev,
-      posts: prev.posts.map((post) => {
-        if (post.id !== postId) return post;
-        const liked = post.likedBy.includes(user.id);
-        return {
-          ...post,
-          likedBy: liked ? post.likedBy.filter((id) => id !== user.id) : [...post.likedBy, user.id],
-        };
-      }),
+      posts: prev.posts.map((post) => (post.id === postId ? { ...post, likedBy: optimisticLikedBy } : post)),
     }));
+
+    void apiRequest(`/api/posts/${encodeURIComponent(postId)}/like`, { method: 'POST' }, true)
+      .then((payload) => {
+        if (!Array.isArray(payload?.likedBy)) return;
+        setDb((prev) => ({
+          ...prev,
+          posts: prev.posts.map((post) =>
+            post.id === postId ? { ...post, likedBy: payload.likedBy.map(String) } : post
+          ),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          posts: prev.posts.map((post) => (post.id === postId ? existing : post)),
+        }));
+      });
     return ok('Like updated.');
   };
 
   const togglePostRepost = (postId: string): ActionResult => {
     if (!user) return fail('Unauthorized.');
+    if (!token) return fail('Unauthorized.');
+    const existing = db.posts.find((post) => post.id === postId);
+    if (!existing) return fail('Post not found.');
+
+    const has = existing.repostedBy.includes(user.id);
+    const optimisticRepostedBy = has
+      ? existing.repostedBy.filter((id) => id !== user.id)
+      : [...existing.repostedBy, user.id];
+
     setDb((prev) => ({
       ...prev,
-      posts: prev.posts.map((post) => {
-        if (post.id !== postId) return post;
-        const has = post.repostedBy.includes(user.id);
-        return {
-          ...post,
-          repostedBy: has ? post.repostedBy.filter((id) => id !== user.id) : [...post.repostedBy, user.id],
-        };
-      }),
+      posts: prev.posts.map((post) => (post.id === postId ? { ...post, repostedBy: optimisticRepostedBy } : post)),
     }));
+
+    void apiRequest(`/api/posts/${encodeURIComponent(postId)}/repost`, { method: 'POST' }, true)
+      .then((payload) => {
+        if (!Array.isArray(payload?.repostedBy)) return;
+        setDb((prev) => ({
+          ...prev,
+          posts: prev.posts.map((post) =>
+            post.id === postId ? { ...post, repostedBy: payload.repostedBy.map(String) } : post
+          ),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          posts: prev.posts.map((post) => (post.id === postId ? existing : post)),
+        }));
+      });
     return ok('Repost updated.');
   };
 
   const addPostComment = (postId: string, text: string): ActionResult => {
     if (!user) return fail('Unauthorized.');
+    if (!token) return fail('Unauthorized.');
     const trimmed = String(text || '').trim();
     if (!trimmed) return fail('Comment is empty.');
     const comment: PostComment = {
-      id: `comment-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      id: `tmp-post-comment-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       postId,
       authorId: user.id,
       text: trimmed,
@@ -730,42 +1023,121 @@ export function useStore(): UseStore {
       createdAt: nowIso(),
     };
     setDb((prev) => ({ ...prev, postComments: [comment, ...prev.postComments] }));
+
+    void apiRequest(
+      `/api/posts/${encodeURIComponent(postId)}/comments`,
+      { method: 'POST', body: JSON.stringify({ text: trimmed }) },
+      true
+    )
+      .then((payload) => {
+        const persisted = payload?.comment ? toPostComment(payload.comment) : null;
+        const usersFromPayload = Array.isArray(payload?.users) ? payload.users.map(toUser) : [];
+        mergeUsers(usersFromPayload);
+        if (!persisted) return;
+        setDb((prev) => ({
+          ...prev,
+          postComments: [persisted, ...prev.postComments.filter((item) => item.id !== comment.id && item.id !== persisted.id)],
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({ ...prev, postComments: prev.postComments.filter((item) => item.id !== comment.id) }));
+      });
+
     return ok('Comment added.');
   };
 
   const editPostComment = (commentId: string, text: string): ActionResult => {
     const trimmed = String(text || '').trim();
     if (!trimmed) return fail('Comment is empty.');
+    if (!user) return fail('Unauthorized.');
+    if (!token) return fail('Unauthorized.');
+    const existing = db.postComments.find((comment) => comment.id === commentId);
+    if (!existing) return fail('Comment not found.');
+
     setDb((prev) => ({
       ...prev,
       postComments: prev.postComments.map((comment) =>
         comment.id === commentId ? { ...comment, text: trimmed } : comment
       ),
     }));
+
+    void apiRequest(
+      `/api/posts/comments/${encodeURIComponent(commentId)}`,
+      { method: 'PATCH', body: JSON.stringify({ text: trimmed }) },
+      true
+    )
+      .then((payload) => {
+        if (!payload?.comment) return;
+        const persisted = toPostComment(payload.comment);
+        setDb((prev) => ({
+          ...prev,
+          postComments: prev.postComments.map((comment) => (comment.id === commentId ? persisted : comment)),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          postComments: prev.postComments.map((comment) => (comment.id === commentId ? existing : comment)),
+        }));
+      });
     return ok('Comment updated.');
   };
 
   const deletePostComment = (commentId: string): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    if (!token) return fail('Unauthorized.');
+    const existing = db.postComments.find((comment) => comment.id === commentId);
+    if (!existing) return fail('Comment not found.');
+
     setDb((prev) => ({
       ...prev,
       postComments: prev.postComments.filter((comment) => comment.id !== commentId),
     }));
+
+    void apiRequest(`/api/posts/comments/${encodeURIComponent(commentId)}`, { method: 'DELETE' }, true).catch(() => {
+      setDb((prev) => ({ ...prev, postComments: [existing, ...prev.postComments] }));
+    });
     return ok('Comment deleted.');
   };
 
   const togglePostCommentLike = (commentId: string): ActionResult => {
     if (!user) return fail('Unauthorized.');
+    if (!token) return fail('Unauthorized.');
+    const existing = db.postComments.find((comment) => comment.id === commentId);
+    if (!existing) return fail('Comment not found.');
+
+    const liked = existing.likedBy.includes(user.id);
+    const optimisticLikedBy = liked
+      ? existing.likedBy.filter((id) => id !== user.id)
+      : [...existing.likedBy, user.id];
+
     setDb((prev) => ({
       ...prev,
       postComments: prev.postComments.map((comment) => {
         if (comment.id !== commentId) return comment;
-        const liked = comment.likedBy.includes(user.id);
         return {
           ...comment,
-          likedBy: liked ? comment.likedBy.filter((id) => id !== user.id) : [...comment.likedBy, user.id],
+          likedBy: optimisticLikedBy,
         };
       }),
     }));
+
+    void apiRequest(`/api/posts/comments/${encodeURIComponent(commentId)}/like`, { method: 'POST' }, true)
+      .then((payload) => {
+        if (!Array.isArray(payload?.likedBy)) return;
+        setDb((prev) => ({
+          ...prev,
+          postComments: prev.postComments.map((comment) =>
+            comment.id === commentId ? { ...comment, likedBy: payload.likedBy.map(String) } : comment
+          ),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          postComments: prev.postComments.map((comment) => (comment.id === commentId ? existing : comment)),
+        }));
+      });
     return ok('Comment like updated.');
   };
 
@@ -863,6 +1235,8 @@ export function useStore(): UseStore {
           ...prev,
           messages: [...prev.messages.filter((item) => item.id !== optimistic.id), persisted],
         }));
+        void fetchChats();
+        void fetchMessagesWith(toUserId);
       } catch {
         setDb((prev) => ({ ...prev, messages: prev.messages.filter((item) => item.id !== optimistic.id) }));
       }
@@ -913,9 +1287,16 @@ export function useStore(): UseStore {
   const updateProfile = (patch: ProfilePatch): ActionResult => {
     if (!user) return fail('Unauthorized.');
 
-    const displayName = String(patch.displayName || user.displayName).trim();
-    const bio = String(patch.bio || '');
-    const avatarUrl = String(patch.avatar || '');
+    const candidateName = patch.displayName !== undefined ? String(patch.displayName || '').trim() : '';
+    const displayName = candidateName || user.displayName;
+    const bio = patch.bio !== undefined ? String(patch.bio || '') : String(user.bio || '');
+    const status = patch.status !== undefined ? String(patch.status || '') : String(user.status || '');
+    const avatarUrl = patch.avatar !== undefined ? String(patch.avatar || '') : String(user.avatar || '');
+    const coverImage =
+      patch.coverImage !== undefined ? String(patch.coverImage || '') : String(user.coverImage || '');
+    const hiddenFromFriends =
+      patch.hiddenFromFriends !== undefined ? Boolean(patch.hiddenFromFriends) : Boolean(user.hiddenFromFriends);
+    const previousUser = user;
 
     setDb((prev) => ({
       ...prev,
@@ -925,9 +1306,10 @@ export function useStore(): UseStore {
               ...candidate,
               displayName,
               bio,
+              status,
               avatar: avatarUrl,
-              coverImage: patch.coverImage || candidate.coverImage,
-              hiddenFromFriends: Boolean(patch.hiddenFromFriends),
+              coverImage,
+              hiddenFromFriends,
               updatedAt: nowIso(),
             }
           : candidate
@@ -938,43 +1320,578 @@ export function useStore(): UseStore {
       '/api/users/me',
       {
         method: 'PUT',
-        body: JSON.stringify({ displayName, bio, avatarUrl }),
+        body: JSON.stringify({ displayName, bio, status, avatarUrl, coverImage, hiddenFromFriends }),
       },
       true
-    ).catch(() => {
-      // keep optimistic profile in UI
-    });
+    )
+      .then((payload) => {
+        if (!payload?.user) return;
+        const persisted = toUser(payload.user);
+        setDb((prev) => ({
+          ...prev,
+          users: prev.users.map((candidate) => (candidate.id === user.id ? persisted : candidate)),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          users: prev.users.map((candidate) =>
+            candidate.id === previousUser.id ? { ...candidate, ...previousUser } : candidate
+          ),
+        }));
+      });
 
     return ok('Profile updated.');
   };
 
-  const createGroup = (_payload: GroupPayload): ActionResult => fail('Groups are disabled in API mode.');
-  const updateGroup = (_groupId: string, _patch: GroupPatch): ActionResult => fail('Groups are disabled in API mode.');
-  const toggleGroupSubscription = (_groupId: string): ActionResult => fail('Groups are disabled in API mode.');
-  const setGroupAllowMemberPosts = (_groupId: string, _allow: boolean): ActionResult =>
-    fail('Groups are disabled in API mode.');
-  const createGroupPost = (
-    _groupId: string,
-    _text: string,
-    _mediaType?: MediaType,
-    _mediaUrl?: string
-  ): ActionResult => fail('Groups are disabled in API mode.');
-  const toggleGroupPostLike = (_groupPostId: string): ActionResult => fail('Groups are disabled in API mode.');
+  const changePassword = async (currentPassword: string, newPassword: string): Promise<ActionResult> => {
+    if (!token) return fail('Unauthorized.');
+    const current = String(currentPassword || '');
+    const next = String(newPassword || '');
+    if (!current || next.length < 6) return fail('Invalid password payload.');
+    try {
+      const payload = await apiRequest(
+        '/api/users/change-password',
+        { method: 'PUT', body: JSON.stringify({ currentPassword: current, newPassword: next }) },
+        true
+      );
+      return ok(String(payload?.message || 'Password updated.'));
+    } catch (error: any) {
+      return fail(String(error?.message || 'Failed to update password.'));
+    }
+  };
+
+  const requestEmailChange = async (newEmail: string): Promise<ActionResult> => {
+    if (!token) return fail('Unauthorized.');
+    const email = String(newEmail || '').trim().toLowerCase();
+    if (!email) return fail('Email is required.');
+    try {
+      const payload = await apiRequest(
+        '/api/users/request-email-change',
+        { method: 'POST', body: JSON.stringify({ newEmail: email }) },
+        true
+      );
+      return ok(String(payload?.message || 'Confirmation code sent.'));
+    } catch (error: any) {
+      return fail(String(error?.message || 'Failed to request email change.'));
+    }
+  };
+
+  const confirmEmailChange = async (code: string): Promise<ActionResult> => {
+    if (!token) return fail('Unauthorized.');
+    const trimmed = String(code || '').trim();
+    if (!trimmed) return fail('Code is required.');
+    try {
+      const payload = await apiRequest(
+        '/api/users/confirm-email-change',
+        { method: 'POST', body: JSON.stringify({ code: trimmed }) },
+        true
+      );
+      if (payload?.user) {
+        const persisted = toUser(payload.user);
+        setDb((prev) => ({
+          ...prev,
+          users: prev.users.map((candidate) => (candidate.id === persisted.id ? persisted : candidate)),
+        }));
+      }
+      return ok('Email updated.');
+    } catch (error: any) {
+      return fail(String(error?.message || 'Failed to confirm email change.'));
+    }
+  };
+
+  const groupAvatar = (name: string) => {
+    const label = encodeURIComponent(String(name || 'Group').slice(0, 40));
+    return `https://ui-avatars.com/api/?name=${label}&background=0f172a&color=ffffff&size=256`;
+  };
+
+  const createGroup = (payload: GroupPayload): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    const name = String(payload.name || '').trim();
+    const description = String(payload.description || '').trim();
+    const allowMemberPosts = Boolean(payload.allowMemberPosts);
+    if (name.length < 3) return fail('Group name is too short.');
+
+    const optimistic: Group = {
+      id: `tmp-group-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      description,
+      adminId: user.id,
+      allowMemberPosts,
+      avatar: groupAvatar(name),
+      coverImage: '',
+      verified: false,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    const optimisticMember: GroupMember = {
+      id: `tmp-gm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      groupId: optimistic.id,
+      userId: user.id,
+      role: 'admin',
+      createdAt: nowIso(),
+    };
+
+    setDb((prev) => ({
+      ...prev,
+      groups: [optimistic, ...prev.groups],
+      groupMembers: [optimisticMember, ...prev.groupMembers],
+    }));
+
+    void apiRequest(
+      '/api/groups',
+      {
+        method: 'POST',
+        body: JSON.stringify({ name, description, allowMemberPosts }),
+      },
+      true
+    )
+      .then((payload) => {
+        const persisted = payload?.group ? toGroup(payload.group) : null;
+        const member = payload?.member ? toGroupMember(payload.member) : null;
+        const payloadUsers = Array.isArray(payload?.users) ? payload.users.map(toUser) : [];
+        mergeUsers(payloadUsers);
+
+        if (!persisted) return;
+        setDb((prev) => ({
+          ...prev,
+          groups: [persisted, ...prev.groups.filter((item) => item.id !== optimistic.id && item.id !== persisted.id)],
+          groupMembers: member
+            ? [
+                member,
+                ...prev.groupMembers.filter(
+                  (item) => item.id !== optimisticMember.id && !(item.groupId === member.groupId && item.userId === member.userId)
+                ),
+              ]
+            : prev.groupMembers.filter((item) => item.id !== optimisticMember.id),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          groups: prev.groups.filter((item) => item.id !== optimistic.id),
+          groupMembers: prev.groupMembers.filter((item) => item.id !== optimisticMember.id),
+        }));
+      });
+
+    return ok('Community created.');
+  };
+
+  const updateGroup = (groupId: string, patch: GroupPatch): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    const existing = db.groups.find((item) => item.id === groupId);
+    if (!existing) return fail('Group not found.');
+    const previous = existing;
+
+    const optimistic: Group = {
+      ...existing,
+      name: String(patch.name || existing.name).trim(),
+      description: String(patch.description || ''),
+      avatar: String(patch.avatar || existing.avatar),
+      coverImage: String(patch.coverImage || ''),
+      verified: Boolean(patch.verified),
+      allowMemberPosts: Boolean(patch.allowMemberPosts),
+      updatedAt: nowIso(),
+    };
+
+    setDb((prev) => ({
+      ...prev,
+      groups: prev.groups.map((item) => (item.id === groupId ? optimistic : item)),
+    }));
+
+    void apiRequest(
+      `/api/groups/${encodeURIComponent(groupId)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({
+          name: optimistic.name,
+          description: optimistic.description,
+          avatar: optimistic.avatar,
+          coverImage: optimistic.coverImage,
+          verified: optimistic.verified,
+          allowMemberPosts: optimistic.allowMemberPosts,
+        }),
+      },
+      true
+    )
+      .then((payload) => {
+        if (!payload?.group) return;
+        const persisted = toGroup(payload.group);
+        setDb((prev) => ({
+          ...prev,
+          groups: prev.groups.map((item) => (item.id === groupId ? persisted : item)),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          groups: prev.groups.map((item) => (item.id === groupId ? previous : item)),
+        }));
+      });
+
+    return ok('Group updated.');
+  };
+
+  const toggleGroupSubscription = (groupId: string): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    if (!groupId) return fail('Group is missing.');
+
+    const existing = db.groupMembers.find((item) => item.groupId === groupId && item.userId === user.id);
+    if (existing) {
+      setDb((prev) => ({
+        ...prev,
+        groupMembers: prev.groupMembers.filter((item) => item.id !== existing.id),
+      }));
+
+      void apiRequest(`/api/groups/${encodeURIComponent(groupId)}/subscribe`, { method: 'DELETE' }, true).catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          groupMembers: [existing, ...prev.groupMembers],
+        }));
+      });
+
+      return ok('Unsubscribed.');
+    }
+
+    const optimistic: GroupMember = {
+      id: `tmp-gm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      groupId,
+      userId: user.id,
+      role: 'member',
+      createdAt: nowIso(),
+    };
+
+    setDb((prev) => ({ ...prev, groupMembers: [optimistic, ...prev.groupMembers] }));
+    void apiRequest(`/api/groups/${encodeURIComponent(groupId)}/subscribe`, { method: 'POST' }, true)
+      .then((payload) => {
+        if (!payload?.member) return;
+        const persisted = toGroupMember(payload.member);
+        setDb((prev) => ({
+          ...prev,
+          groupMembers: [persisted, ...prev.groupMembers.filter((item) => item.id !== optimistic.id)],
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({ ...prev, groupMembers: prev.groupMembers.filter((item) => item.id !== optimistic.id) }));
+      });
+
+    return ok('Subscribed.');
+  };
+
+  const setGroupAllowMemberPosts = (groupId: string, allow: boolean): ActionResult =>
+    updateGroup(groupId, {
+      ...(db.groups.find((item) => item.id === groupId) || {
+        name: '',
+        description: '',
+        avatar: '',
+        coverImage: '',
+        verified: false,
+      }),
+      allowMemberPosts: allow,
+    } as GroupPatch);
+
+  const createGroupPost = (groupId: string, text: string, mediaType?: MediaType, mediaUrl?: string): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    const trimmed = String(text || '').trim();
+    const url = String(mediaUrl || '').trim();
+    if (!trimmed && !url) return fail('Post is empty.');
+
+    const optimistic: GroupPost = {
+      id: `tmp-gpost-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      groupId,
+      authorId: user.id,
+      text: trimmed,
+      mediaType,
+      mediaUrl: url || undefined,
+      createdAt: nowIso(),
+      likedBy: [],
+      repostedBy: [],
+    };
+
+    setDb((prev) => ({ ...prev, groupPosts: [optimistic, ...prev.groupPosts] }));
+
+    void apiRequest(
+      `/api/groups/${encodeURIComponent(groupId)}/posts`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          content: trimmed,
+          mediaType: mediaType || undefined,
+          mediaUrl: url || undefined,
+        }),
+      },
+      true
+    )
+      .then((payload) => {
+        if (!payload?.post) return;
+        const persisted = toGroupPost(payload.post);
+        setDb((prev) => ({
+          ...prev,
+          groupPosts: [persisted, ...prev.groupPosts.filter((item) => item.id !== optimistic.id)],
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({ ...prev, groupPosts: prev.groupPosts.filter((item) => item.id !== optimistic.id) }));
+      });
+
+    return ok('Published.');
+  };
+
+  const toggleGroupPostLike = (groupPostId: string): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    const existing = db.groupPosts.find((item) => item.id === groupPostId);
+    if (!existing) return fail('Post not found.');
+
+    const liked = existing.likedBy.includes(user.id);
+    const optimisticLikedBy = liked ? existing.likedBy.filter((id) => id !== user.id) : [...existing.likedBy, user.id];
+
+    setDb((prev) => ({
+      ...prev,
+      groupPosts: prev.groupPosts.map((item) => (item.id === groupPostId ? { ...item, likedBy: optimisticLikedBy } : item)),
+    }));
+
+    void apiRequest(`/api/groups/posts/${encodeURIComponent(groupPostId)}/like`, { method: 'POST' }, true)
+      .then((payload) => {
+        if (!Array.isArray(payload?.likedBy)) return;
+        setDb((prev) => ({
+          ...prev,
+          groupPosts: prev.groupPosts.map((item) =>
+            item.id === groupPostId ? { ...item, likedBy: payload.likedBy.map(String) } : item
+          ),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          groupPosts: prev.groupPosts.map((item) => (item.id === groupPostId ? existing : item)),
+        }));
+      });
+
+    return ok('Like updated.');
+  };
+
   const repostGroupPost = (_groupPostId: string, _targetGroupId: string): ActionResult =>
-    fail('Groups are disabled in API mode.');
-  const repostGroupPostToProfile = (_groupPostId: string): ActionResult =>
-    fail('Groups are disabled in API mode.');
+    fail('Repost between groups is not supported yet.');
+
+  const repostGroupPostToProfile = (groupPostId: string): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    const existing = db.groupPosts.find((item) => item.id === groupPostId);
+    if (!existing) return fail('Post not found.');
+
+    const has = existing.repostedBy.includes(user.id);
+    const optimistic = has ? existing.repostedBy.filter((id) => id !== user.id) : [...existing.repostedBy, user.id];
+    setDb((prev) => ({
+      ...prev,
+      groupPosts: prev.groupPosts.map((item) => (item.id === groupPostId ? { ...item, repostedBy: optimistic } : item)),
+    }));
+
+    void apiRequest(`/api/groups/posts/${encodeURIComponent(groupPostId)}/repost`, { method: 'POST' }, true)
+      .then((payload) => {
+        if (!Array.isArray(payload?.repostedBy)) return;
+        setDb((prev) => ({
+          ...prev,
+          groupPosts: prev.groupPosts.map((item) =>
+            item.id === groupPostId ? { ...item, repostedBy: payload.repostedBy.map(String) } : item
+          ),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          groupPosts: prev.groupPosts.map((item) => (item.id === groupPostId ? existing : item)),
+        }));
+      });
+
+    return ok('Repost updated.');
+  };
+
   const publishGroupPostToFeed = (_groupPostId: string): ActionResult =>
-    fail('Groups are disabled in API mode.');
-  const editGroupPost = (_groupPostId: string, _text: string): ActionResult => fail('Groups are disabled in API mode.');
-  const deleteGroupPost = (_groupPostId: string): ActionResult => fail('Groups are disabled in API mode.');
-  const addGroupPostComment = (_groupPostId: string, _text: string): ActionResult =>
-    fail('Groups are disabled in API mode.');
-  const editGroupPostComment = (_commentId: string, _text: string): ActionResult =>
-    fail('Groups are disabled in API mode.');
-  const deleteGroupPostComment = (_commentId: string): ActionResult => fail('Groups are disabled in API mode.');
-  const toggleGroupPostCommentLike = (_commentId: string): ActionResult =>
-    fail('Groups are disabled in API mode.');
+    fail('Publishing group posts to feed is not supported yet.');
+
+  const editGroupPost = (groupPostId: string, text: string): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return fail('Post is empty.');
+
+    const existing = db.groupPosts.find((item) => item.id === groupPostId);
+    if (!existing) return fail('Post not found.');
+    const previous = existing;
+
+    setDb((prev) => ({
+      ...prev,
+      groupPosts: prev.groupPosts.map((item) => (item.id === groupPostId ? { ...item, text: trimmed } : item)),
+    }));
+
+    void apiRequest(
+      `/api/groups/posts/${encodeURIComponent(groupPostId)}`,
+      { method: 'PATCH', body: JSON.stringify({ content: trimmed }) },
+      true
+    )
+      .then((payload) => {
+        if (!payload?.post) return;
+        const persisted = toGroupPost(payload.post);
+        setDb((prev) => ({
+          ...prev,
+          groupPosts: prev.groupPosts.map((item) => (item.id === groupPostId ? { ...item, ...persisted } : item)),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          groupPosts: prev.groupPosts.map((item) => (item.id === groupPostId ? previous : item)),
+        }));
+      });
+
+    return ok('Post updated.');
+  };
+
+  const deleteGroupPost = (groupPostId: string): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    const existing = db.groupPosts.find((item) => item.id === groupPostId);
+    if (!existing) return fail('Post not found.');
+
+    setDb((prev) => {
+      const removedIds = new Set([groupPostId]);
+      return {
+        ...prev,
+        groupPosts: prev.groupPosts.filter((item) => item.id !== groupPostId),
+        groupPostComments: prev.groupPostComments.filter((item) => !removedIds.has(item.groupPostId)),
+      };
+    });
+
+    void apiRequest(`/api/groups/posts/${encodeURIComponent(groupPostId)}`, { method: 'DELETE' }, true).catch(() => {
+      setDb((prev) => ({ ...prev, groupPosts: [existing, ...prev.groupPosts] }));
+    });
+
+    return ok('Post deleted.');
+  };
+
+  const addGroupPostComment = (groupPostId: string, text: string): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return fail('Comment is empty.');
+
+    const optimistic: GroupPostComment = {
+      id: `tmp-gc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      groupPostId,
+      authorId: user.id,
+      text: trimmed,
+      likedBy: [],
+      createdAt: nowIso(),
+    };
+
+    setDb((prev) => ({ ...prev, groupPostComments: [...prev.groupPostComments, optimistic] }));
+
+    void apiRequest(
+      `/api/groups/posts/${encodeURIComponent(groupPostId)}/comments`,
+      { method: 'POST', body: JSON.stringify({ text: trimmed }) },
+      true
+    )
+      .then((payload) => {
+        if (!payload?.comment) return;
+        const persisted = toGroupPostComment(payload.comment);
+        setDb((prev) => ({
+          ...prev,
+          groupPostComments: prev.groupPostComments.map((item) => (item.id === optimistic.id ? persisted : item)),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          groupPostComments: prev.groupPostComments.filter((item) => item.id !== optimistic.id),
+        }));
+      });
+
+    return ok('Comment added.');
+  };
+
+  const editGroupPostComment = (commentId: string, text: string): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return fail('Comment is empty.');
+    const existing = db.groupPostComments.find((item) => item.id === commentId);
+    if (!existing) return fail('Comment not found.');
+    const previous = existing;
+
+    setDb((prev) => ({
+      ...prev,
+      groupPostComments: prev.groupPostComments.map((item) => (item.id === commentId ? { ...item, text: trimmed } : item)),
+    }));
+
+    void apiRequest(
+      `/api/groups/comments/${encodeURIComponent(commentId)}`,
+      { method: 'PATCH', body: JSON.stringify({ text: trimmed }) },
+      true
+    )
+      .then((payload) => {
+        if (!payload?.comment) return;
+        const persisted = toGroupPostComment(payload.comment);
+        setDb((prev) => ({
+          ...prev,
+          groupPostComments: prev.groupPostComments.map((item) => (item.id === commentId ? persisted : item)),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          groupPostComments: prev.groupPostComments.map((item) => (item.id === commentId ? previous : item)),
+        }));
+      });
+
+    return ok('Comment updated.');
+  };
+
+  const deleteGroupPostComment = (commentId: string): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    const existing = db.groupPostComments.find((item) => item.id === commentId);
+    if (!existing) return fail('Comment not found.');
+
+    setDb((prev) => ({
+      ...prev,
+      groupPostComments: prev.groupPostComments.filter((item) => item.id !== commentId),
+    }));
+
+    void apiRequest(`/api/groups/comments/${encodeURIComponent(commentId)}`, { method: 'DELETE' }, true).catch(() => {
+      setDb((prev) => ({ ...prev, groupPostComments: [...prev.groupPostComments, existing] }));
+    });
+
+    return ok('Comment deleted.');
+  };
+
+  const toggleGroupPostCommentLike = (commentId: string): ActionResult => {
+    if (!user) return fail('Unauthorized.');
+    const existing = db.groupPostComments.find((item) => item.id === commentId);
+    if (!existing) return fail('Comment not found.');
+
+    const liked = existing.likedBy.includes(user.id);
+    const optimistic = liked ? existing.likedBy.filter((id) => id !== user.id) : [...existing.likedBy, user.id];
+
+    setDb((prev) => ({
+      ...prev,
+      groupPostComments: prev.groupPostComments.map((item) =>
+        item.id === commentId ? { ...item, likedBy: optimistic } : item
+      ),
+    }));
+
+    void apiRequest(`/api/groups/comments/${encodeURIComponent(commentId)}/like`, { method: 'POST' }, true)
+      .then((payload) => {
+        if (!Array.isArray(payload?.likedBy)) return;
+        setDb((prev) => ({
+          ...prev,
+          groupPostComments: prev.groupPostComments.map((item) =>
+            item.id === commentId ? { ...item, likedBy: payload.likedBy.map(String) } : item
+          ),
+        }));
+      })
+      .catch(() => {
+        setDb((prev) => ({
+          ...prev,
+          groupPostComments: prev.groupPostComments.map((item) => (item.id === commentId ? existing : item)),
+        }));
+      });
+
+    return ok('Like updated.');
+  };
 
   const patchAdminUser = (
     targetUserId: string,
@@ -1158,6 +2075,7 @@ export function useStore(): UseStore {
     activeGroupId,
     register,
     verifyPending,
+    resendVerificationCode,
     login,
     logout,
     setTheme,
@@ -1182,6 +2100,9 @@ export function useStore(): UseStore {
     markChatRead,
     markNotificationsRead,
     updateProfile,
+    changePassword,
+    requestEmailChange,
+    confirmEmailChange,
     createGroup,
     updateGroup,
     toggleGroupSubscription,

@@ -9,6 +9,7 @@ import Notifications from './components/Notifications';
 import Messages from './components/Messages';
 import AdminPanel from './components/AdminPanel';
 import Groups from './components/Groups';
+import Settings from './components/Settings';
 import { ActionResult } from './types';
 import { useStore } from './store/useStore';
 
@@ -41,6 +42,7 @@ const App: React.FC = () => {
     activeGroupId,
     register,
     verifyPending,
+    resendVerificationCode,
     login,
     logout,
     setTheme,
@@ -64,6 +66,9 @@ const App: React.FC = () => {
     markChatRead,
     markNotificationsRead,
     updateProfile,
+    changePassword,
+    requestEmailChange,
+    confirmEmailChange,
     createGroup,
     updateGroup,
     toggleGroupSubscription,
@@ -251,6 +256,11 @@ const App: React.FC = () => {
         setCurrentViewRef.current('messages');
         return;
       }
+      if (hash === '/settings') {
+        setActiveHashtag(null);
+        setCurrentViewRef.current('settings');
+        return;
+      }
       if (chatMatch) {
         const targetUserId = decodeURIComponent(chatMatch[1]);
         setActiveHashtag(null);
@@ -322,6 +332,12 @@ const App: React.FC = () => {
     setActiveGroup(groupId);
     setCurrentView('groups');
     setHash(groupId ? `/g/${encodeURIComponent(groupId)}` : '/groups');
+  };
+
+  const openSettings = () => {
+    setActiveHashtag(null);
+    setCurrentView('settings');
+    setHash('/settings');
   };
 
   const openHashtag = (tag: string) => {
@@ -404,6 +420,9 @@ const App: React.FC = () => {
     } else if (view === 'explore') {
       setActiveHashtag(null);
       setHash('/explore');
+    } else if (view === 'settings') {
+      setActiveHashtag(null);
+      setHash('/settings');
     } else {
       setActiveHashtag(null);
       setHash('/');
@@ -415,8 +434,6 @@ const App: React.FC = () => {
     return (
       <>
         <AuthScreen
-          darkMode={darkMode}
-          onToggleTheme={() => setTheme(darkMode ? 'light' : 'dark')}
           onLogin={async (username, password) => {
             const result = await login({ username, password });
             showResult(result);
@@ -429,6 +446,11 @@ const App: React.FC = () => {
           }}
           onVerify={async (code) => {
             const result = await verifyPending(code);
+            showResult(result);
+            return result;
+          }}
+          onResendCode={async () => {
+            const result = await resendVerificationCode();
             showResult(result);
             return result;
           }}
@@ -612,6 +634,7 @@ const App: React.FC = () => {
             onOpenProfile={openProfile}
             onOpenHashtag={openHashtag}
             onOpenGroup={openGroup}
+            onOpenSettings={openSettings}
             onBack={() => {
               setActiveHashtag(null);
               setCurrentView('feed');
@@ -621,6 +644,16 @@ const App: React.FC = () => {
               navigator.clipboard.writeText(value);
               pushToast(true, 'Profile link copied.');
             }}
+          />
+        );
+      case 'settings':
+        return (
+          <Settings
+            currentUser={user}
+            onBack={() => openProfile(user.id)}
+            onChangePassword={async (current, next) => changePassword(current, next)}
+            onRequestEmailChange={async (email) => requestEmailChange(email)}
+            onConfirmEmailChange={async (code) => confirmEmailChange(code)}
           />
         );
       case 'admin':

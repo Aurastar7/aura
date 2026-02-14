@@ -76,6 +76,7 @@ const Layout: React.FC<LayoutProps> = ({
     notifications: ICONS.Notifications,
     messages: ICONS.Messages,
     profile: ICONS.Profile,
+    settings: ICONS.Settings,
     admin: ICONS.Shield,
   };
 
@@ -131,7 +132,7 @@ const Layout: React.FC<LayoutProps> = ({
         <div className="grid grid-cols-6">
           {mobileItems.map((view) => {
             const Icon = iconByView[view];
-            const active = currentView === view;
+            const active = currentView === view || (currentView === 'settings' && view === 'profile');
             return (
               <button key={view} onClick={() => onChangeView(view)} className="py-2.5 grid place-items-center relative">
                 <span className={`w-10 h-10 rounded-xl grid place-items-center ${active ? 'bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-white' : 'text-slate-500 dark:text-slate-400'}`}>

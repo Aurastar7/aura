@@ -27,6 +27,7 @@ interface ProfileProps {
   onOpenHashtag: (tag: string) => void;
   onOpenGroup: (groupId: string) => void;
   onCopyProfileLink: (link: string) => void;
+  onOpenSettings: () => void;
   onBack: () => void;
 }
 
@@ -61,6 +62,7 @@ const Profile: React.FC<ProfileProps> = ({
   onOpenHashtag,
   onOpenGroup,
   onCopyProfileLink,
+  onOpenSettings,
   onBack,
 }) => {
   const isOwn = viewer.id === profileUser.id;
@@ -235,9 +237,20 @@ const Profile: React.FC<ProfileProps> = ({
 
           <div className="ml-auto min-w-0 flex-1 flex flex-wrap justify-end gap-1.5 sm:gap-2">
             {isOwn ? (
-              <button onClick={() => setEditing((prev) => !prev)} className="border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 px-2 sm:px-4 py-1.5 sm:py-2 rounded-xl sm:rounded-2xl text-[11px] sm:text-base font-bold text-slate-900 dark:text-white transition-colors leading-tight">
-                {editing ? 'Cancel' : 'Edit Profile'}
-              </button>
+              <>
+                <button
+                  onClick={() => setEditing((prev) => !prev)}
+                  className="border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 px-2 sm:px-4 py-1.5 sm:py-2 rounded-xl sm:rounded-2xl text-[11px] sm:text-base font-bold text-slate-900 dark:text-white transition-colors leading-tight"
+                >
+                  {editing ? 'Cancel' : 'Edit Profile'}
+                </button>
+                <button
+                  onClick={onOpenSettings}
+                  className="border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 px-2 sm:px-4 py-1.5 sm:py-2 rounded-xl sm:rounded-2xl text-[11px] sm:text-base font-bold text-slate-900 dark:text-white transition-colors leading-tight"
+                >
+                  Settings
+                </button>
+              </>
             ) : (
               <>
                 <button onClick={() => onMessage(profileUser.id)} className="border-2 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-900 px-2 sm:px-4 py-1.5 sm:py-2 rounded-xl sm:rounded-2xl text-[11px] sm:text-base font-bold text-slate-900 dark:text-white transition-colors leading-tight">
